@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='dataspace-client',
-    version='0.1.3.7',
+    version='0.1.3.8',
     author='Anton Gustafsson',
     author_email='anton.gustafsson@ri.se',
     description='This is a tool for connecting to a dataspace created with publish subscribe paradigm.',
