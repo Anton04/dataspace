@@ -545,6 +545,16 @@ class DataHub:
 
         server.Publish(topic, payload, qos, retain, properties)
 
+    def Link(self,url, target):
+
+        server_adress,topic = self.SplitPath(url)
+
+        server = self.add_server(server_adress)
+
+        self.DebugPrint("Publishing to: " + url)
+
+        server.Publish(topic + "?link=" + target,"")
+
 
     def DebugPrint(self,message):
         if self.debug:
