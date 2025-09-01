@@ -1,6 +1,5 @@
-
-
 #NEW version
+from __future__ import annotations
 import paho.mqtt.client as mqtt
 import json
 import traceback
@@ -24,6 +23,16 @@ import base64
 #from IPython.display import display, HTML
 import uuid
 
+
+
+__all__ = ["DataHub", "datahub", "__version__"]
+__version__ = "0.1.3.15"
+
+
+
+
+
+
 def is_notebook() -> bool:
     return is_colab() or is_jupyter_notebook()
 
@@ -46,7 +55,7 @@ def is_jupyter_notebook():
 _is_notebook = is_notebook()
 
 if  _is_notebook:
-    from IPython.display import Image, display, clear_output
+    from IPython.display import Image, display, clear_output, HTML
     import ipywidgets as widgets
 
 
@@ -240,7 +249,7 @@ class GetObject():
 class Broker:
     def __init__(self, broker, port, user, passw, basepath):
 
-        print("Connecting as: " + user + "@" + broker + ":" + str(port))
+        print("Connecting as: " + str(user) + "@" + broker + ":" + str(port))
 
         self.client_id = f'client-{uuid.uuid4()}'
         self.client = mqtt.Client(client_id=self.client_id, protocol=mqtt.MQTTv5)  # Use the latest MQTT version
@@ -413,19 +422,76 @@ class DataHub:
 
     def add_credentials(self, server, username, password):
 
+        """Store credentials for a server. There is no connection make until a get, subscribe or publish is done.
+
+        Args:
+            server_url: Full URL like "mqtt://host[:port]" or "mqtts://host[:port]".
+            user:       Username.
+            password:   Password (stored in-memory for this process).
+
+        Notes:
+            The internal key is normalized to host[:port] without scheme.
+        """
+
         #Remove mqtt:// if it server starts with it
         if server.find("mqtt://") == 0:
           server = server[len("mqtt://"):]
 
         self.credentials[server] = {"user": username, "password": password}
 
+    def login(self, server: str, user: str,
+              password: str | None = None, *, prompt_password: bool = True):
+        """Prompt for a password (if not given) and register credentials.
+
+        Args:
+            server: Host or full URL (e.g. "iot.example.com" or "mqtts://iot.example.com:8883").
+            user:   Username to authenticate with.
+            password: Optional password. If omitted and `prompt_password=True`,
+                      a hidden prompt will be shown (falls back to visible input if needed).
+            prompt_password: Whether to prompt when `password` is None.
+
+        Returns:
+            DataHub: The same instance (allows chaining).
+
+        Examples:
+            >>> from dataspace_client import datahub
+            >>> datahub.login("iot.example.com", "alice")   # prompts for password
+            <dataspace_client.DataHub ...>
+        """
+        if password is None and prompt_password:
+            try:
+                import getpass  # lazy import: only when needed
+                password = getpass.getpass(f"Password for {user}@{server}: ")
+            except Exception:
+                # Fallback for environments without a controllable TTY (some notebooks)
+                password = input(f"Password for {user}@{server}: ")
+
+        server_url = server if server.startswith(("mqtt://", "mqtts://")) else f"mqtt://{server}"
+        self.add_credentials(server_url, user, password)
+        return self
+
     def add_server(self, server_adress):
+
+        if not server_adress or len(server_adress) == 0:
+            self.DebugPrint("No server adress given",True)
+            return None
 
         if server_adress in self.servers:
             self.DebugPrint(f"Server {server_adress} already exists")
             return self.servers[server_adress]
 
-        credentials = self.credentials.get(server_adress)
+        server_adress_wo_scheme = server_adress
+        if server_adress.find("mqtt://") == 0:
+            server_adress_wo_scheme = server_adress[len("mqtt://"):]
+        elif server_adress.find("mqtts://") == 0:
+            server_adress_wo_scheme = server_adress[len("mqtts://"):]
+        #In case of websocket, remove ws:// or wss://
+        elif server_adress.find("ws://") == 0:
+            server_adress_wo_scheme = server_adress[len("ws://"):]
+        elif server_adress.find("wss://") == 0:
+            server_adress_wo_scheme = server_adress[len("wss://"):]
+
+        credentials = self.credentials.get(server_adress_wo_scheme)
         if not credentials:
             self.DebugPrint(f"No credentials found for server: {server_adress}")
             credentials = {"user": None, "password": None}
@@ -499,6 +565,49 @@ class DataHub:
             return
 
         return server.Get(topic, blocking=blocking, handler=handler, timeout=timeout)
+    
+
+    def add_user_with_role(self, server_url,  
+                       username, password, fullname=None,
+                       create_user_dir=True):
+        
+        # If no protocol is given, assume mqtt:// 
+        if server_url.find("mqtt://") != 0 and server_url.find("mqtts://") != 0 and server_url.find("ws://") != 0 and server_url.find("wss://") != 0:
+            server_url = "mqtt://" + server_url
+      
+        server_adress,path = self.SplitPath(server_url)
+
+        server = self.add_server(server_adress)
+
+        dyn = DynSec(server)
+
+        rolename = f"{username}_role"
+        user_topic_pattern = f"datadirectory/Users/{username}/#"
+        private_topic_pattern = f"$private/+/datadirectory/Users/{username}/#"
+        name_topic = f"datadirectory/Users/{username}/name"
+
+        # 1) role + ACLs
+        dyn.create_role(rolename, textname=f"Role for {username}")
+        for acl in [
+            ("publishClientSend",    user_topic_pattern,    True, 1),
+            ("publishClientReceive", user_topic_pattern,    True, 1),
+            ("subscribePattern",     user_topic_pattern,    True, 1),
+            ("subscribePattern",     private_topic_pattern, True, 1),
+            ("publishClientReceive", private_topic_pattern, True, 1),
+        ]:
+            dyn.add_role_acl(rolename, acl[0], acl[1], allow=acl[2], priority=acl[3])
+
+        # 2) client + bind role
+        dyn.create_client(username, password, textname=fullname or username)
+        dyn.add_client_role(username, rolename, priority=1)
+
+        # 3) skriv namn i din datastruktur (retained)
+        if create_user_dir and fullname:
+            payload = json.dumps({"default": fullname}).encode("utf-8")
+            broker.Publish(name_topic, payload, qos=1, retain=True)
+
+        return True
+
 
     def GetFilesAt(self,url,epoc_time,handler=default_handler):
 
@@ -556,6 +665,191 @@ class DataHub:
         server.Publish(topic + "?link=" + target,"")
 
 
-    def DebugPrint(self,message):
-        if self.debug:
+    def DebugPrint(self,message,force=False):
+        if self.debug or force:
           print(message)
+
+
+
+
+
+import json
+import uuid
+import threading
+
+CONTROL_TOPIC  = "$CONTROL/dynamic-security/v1"
+RESPONSE_TOPIC = "$CONTROL/dynamic-security/v1/response"
+
+class DynSec:
+    """
+    Enkel dynsec-klient:
+    - Persistent prenumeration på response-topic
+    - Registrerar väntare (Event) innan publish
+    - Matchar svar via correlationData och triggar Event
+    """
+
+    def __init__(self, broker):
+        """
+        broker: din Broker-instans (måste ha .client (Paho) och .Subscribe(topic, handler))
+        """
+        self.broker = broker
+        self._waiters = {}  # corr_id -> threading.Event
+        self._answers = {}  # corr_id -> response
+        self._subscribed = False
+        self._ensure_subscribed()
+
+    # ---- intern: se till att vi lyssnar på responstopicen en gång ----
+    def _ensure_subscribed(self):
+        if not self._subscribed:
+            self.broker.Subscribe(RESPONSE_TOPIC, self._on_response)
+            self._subscribed = True  # idempotent nog; din Broker kan själv hantera dubbletter
+
+    # ---- generell handler för alla dynsec-svar ----
+    def _on_response(self, topic, payload, private):
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except Exception:
+            return
+
+        responses = data.get("responses", [])
+        if not isinstance(responses, list):
+            return
+
+        for r in responses:
+            corr = r.get("correlationData")
+            if not corr:
+                continue
+            evt = self._waiters.get(corr)
+            if evt is not None:
+                # Viktigt: skriv svaret före vi signalerar eventet
+                self._answers[corr] = r
+                evt.set()
+            else:
+                # Ingen väntare registrerad för detta id (ignorera/logga vid behov)
+                pass
+
+    # ---- low-level: skicka kommando och vänta på svaret ----
+    def _send(self, command: str, data: dict | None, timeout: float = 10.0) -> dict:
+        corr = str(uuid.uuid4())
+        cmd = {"command": command, "correlationData": corr}
+        if data:
+            cmd.update(data)
+        payload = {"commands": [cmd]}
+
+        # registrera väntaren FÖRE publish
+        evt = threading.Event()
+        self._waiters[corr] = evt
+
+        # publicera (QoS 1) och vänta tills Paho skickat klart för att minska race
+        info = self.broker.client.publish(
+            CONTROL_TOPIC,
+            json.dumps(payload).encode("utf-8"),
+            qos=1,
+            retain=False
+        )
+        info.wait_for_publish()
+
+        # vänta på att handlern triggar vår Event
+        ok = evt.wait(timeout)
+
+        # plocka svaret och städa
+        resp = self._answers.pop(corr, None)
+        self._waiters.pop(corr, None)
+
+        if not ok or resp is None:
+            raise RuntimeError(f"dynsec timeout for {command}")
+
+        # enkel fel/idempotens-hantering
+        if resp.get("error"):
+            msg = str(resp.get("errorMessage") or resp.get("error"))
+            if "already" not in msg.lower():
+                raise RuntimeError(f"dynsec error for {command}: {msg}")
+        return resp
+
+    # ---- publika operationer ----
+    def create_role(self, rolename, textname=None):
+        data = {"rolename": rolename}
+        if textname:
+            data["textname"] = textname
+        return self._send("createRole", data)
+
+    def add_role_acl(self, rolename, acltype, topic, allow=True, priority=1):
+        return self._send("addRoleACL", {
+            "rolename": rolename,
+            "acltype": acltype,
+            "topic": topic,
+            "allow": allow,
+            "priority": priority
+        })
+
+    def create_client(self, username, password, textname=None):
+        data = {"username": username, "password": password}
+        if textname:
+            data["textname"] = textname
+        return self._send("createClient", data)
+
+    def add_client_role(self, username, rolename, priority=1):
+        return self._send("addClientRole", {
+            "username": username,
+            "rolename": rolename,
+            "priority": priority
+        })
+    
+    # ---------- NEW: group ops ----------
+    def create_group(self, groupname: str):
+        return self._send("createGroup", {"groupname": groupname})
+
+    def add_group_client(self, groupname: str, username: str):
+        return self._send("addGroupClient", {"groupname": groupname, "username": username})
+
+    def add_group_role(self, groupname: str, rolename: str, priority: int = 1):
+        return self._send("addGroupRole", {"groupname": groupname, "rolename": rolename, "priority": priority})
+
+    def ensure_group_permissions(self, groupname: str) -> dict:
+        """
+        Ensure a role for the group exists with R/W perms on the group's dataspace, and attach it to the group.
+        ACLs mirror your user-space defaults but for the group-space.
+        """
+        role = f"group_{groupname}_role"
+
+        # 1) create role (idempotent)
+        try:
+            self.create_role(role, textname=f"Role for group {groupname}")
+        except RuntimeError as e:
+            # ignore "already exists"
+            if "already" not in str(e).lower():
+                raise
+
+        # 2) add ACLs on group dataspace
+        group_topic = f"datadirectory/Groups/{groupname}/#"
+        private_pat = f"$private/+/{group_topic}"
+
+        acls = [
+            ("publishClientSend",    group_topic, True, 1),
+            ("publishClientReceive", group_topic, True, 1),
+            ("subscribePattern",     group_topic, True, 1),
+            ("subscribePattern",     private_pat, True, 1),
+            ("publishClientReceive", private_pat, True, 1),
+        ]
+        for acltype, topic, allow, prio in acls:
+            try:
+                self.add_role_acl(role, acltype, topic, allow=allow, priority=prio)
+            except RuntimeError as e:
+                if "already" not in str(e).lower():
+                    raise
+
+        # 3) attach role to group (idempotent)
+        try:
+            self.add_group_role(groupname, role, priority=1)
+        except RuntimeError as e:
+            if "already" not in str(e).lower():
+                raise
+
+        return {"group": groupname, "role": role, "acls": len(acls)}
+
+
+
+# Skapa global instans vid import (ingen lazy)
+datahub = DataHub()
+
+
