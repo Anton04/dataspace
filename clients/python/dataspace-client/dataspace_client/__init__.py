@@ -604,7 +604,7 @@ class DataHub:
         # 3) skriv namn i din datastruktur (retained)
         if create_user_dir and fullname:
             payload = json.dumps({"default": fullname}).encode("utf-8")
-            broker.Publish(name_topic, payload, qos=1, retain=True)
+            server.Publish(name_topic, payload, qos=1, retain=True)
 
         return True
 
