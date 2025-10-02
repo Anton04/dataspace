@@ -8,7 +8,7 @@ import datetime
 import pytz
 import io
 import threading
-import pandas as pd
+#import pandas as pd
 import uuid
 #from IPython.display import Image, display
 import imghdr
@@ -16,8 +16,8 @@ from urllib.parse import urlparse
 from ast import Pass
 #from pythreejs import *
 #from IPython.display import display
-import numpy as np
-import trimesh
+#import numpy as np
+#import trimesh
 import base64
 #import ipywidgets as widgets
 #from IPython.display import display, HTML
@@ -316,6 +316,7 @@ class Broker:
         return None
 
     def GetDataFrame(self, topic, timeout=10):
+        import pandas as pd
         data = self.Get(topic, blocking=True, handler=None, timeout=timeout)
         df = pd.read_json(data.decode("utf-8"), lines=True, orient="records")
         df.index = pd.to_datetime(df["time"], unit="s")

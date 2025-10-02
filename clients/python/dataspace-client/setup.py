@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='dataspace-client',
-    version='0.1.3.16',
+    version='0.1.3.17',
     author='Anton Gustafsson',
     author_email='anton.gustafsson@ri.se',
     description='Client for a publish/subscribe dataspace (MQTT-based) with convenience helpers.',
