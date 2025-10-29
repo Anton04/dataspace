@@ -19,6 +19,78 @@ from typing import List, Tuple, Iterable
 import os, sys
 import bpy
 
+# SmartPaste functionality for easier code pasting
+from . import smartpaste
+
+smartpaste.register()
+
+def handle_mqtt_url_paste(clip: str):
+    """Handles pasted mqtt:// or mqtts:// URLs that end with .glb."""
+    import traceback
+
+    clip = (clip or "").strip()
+    if not clip.startswith(("mqtt://", "mqtts://")) or not clip.lower().endswith(".glb"):
+        print(f"[SmartPaste] Ignorerar: {clip!r}")
+        return
+
+    print(f"[SmartPaste] Hanterar MQTT-URL från urklipp: {clip!r}")
+
+    # ensure credentials
+    if not _ensure_credentials_for_url(clip):
+        print("[SmartPaste] Saknar credentials – öppnar dialog...")
+        return
+
+    # try import
+    try:
+        data = datahub.Get(clip, handler=None)
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("DataHub.Get did not return bytes for a GLB path")
+
+        objs = import_glb_bytes(data, select_import=True, frame_view=True)
+        for o in objs:
+            try:
+                o[DATAHUB_URL_PROP] = clip
+            except Exception:
+                pass
+
+        print(f"[SmartPaste] Importerat {len(objs)} objekt från {clip}")
+        try:
+            bpy.ops.wm.redraw_timer(type='DRAW_WIN', iterations=1)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[SmartPaste] Fel vid import av {clip}: {e}")
+        traceback.print_exc()
+
+
+smartpaste.register_handler(["mqtt://*.glb", "mqtts://*.glb"], handle_mqtt_url_paste)
+
+def handle_mqtt_folder_paste(clip: str):
+    """Handles pasted mqtt:// or mqtts:// URLs that end with a slash (/). Opens import dialog at that folder."""
+    clip = (clip or "").strip()
+    if not clip.endswith("/"):
+        return  # not a folder URL
+    if not clip.startswith(("mqtt://", "mqtts://")):
+        return
+
+    print(f"[SmartPaste] Opening import dialog for folder: {clip}")
+
+    # Ensure credentials
+    if not _ensure_credentials_for_url(clip):
+        print("[SmartPaste] Missing credentials — opening dialog...")
+        return
+
+    try:
+        # Set the path for the import dialog and invoke it
+        bpy.ops.datahub.import_remote_glb('INVOKE_DEFAULT', folder_path=clip)
+    except Exception as e:
+        print(f"[SmartPaste] Failed to open import dialog for {clip}: {e}")
+
+# ✅ NEW — handle folders
+smartpaste.register_handler(["mqtt://*/", "mqtts://*/"], handle_mqtt_folder_paste)
+
+
 ADDON_DIR = os.path.dirname(__file__)
 MODULES_DIR = os.path.join(ADDON_DIR, "modules")
 if os.path.isdir(MODULES_DIR) and MODULES_DIR not in sys.path:
@@ -74,21 +146,28 @@ os.makedirs(_LIBS_DIR, exist_ok=True)
 if str(_LIBS_DIR) not in sys.path:
     sys.path.insert(0, str(_LIBS_DIR))
 
-def _install_dataspace_client(upgrade: bool = True) -> None:
-    """Installera dataspace_client till add-onets /libs med Blenders Python."""
+def _install_dataspace_client(upgrade=True):
+    import sys, subprocess, importlib, os, pathlib  # flytta in import här
     py = sys.executable
-    # Se till att pip finns
+    libs = _LIBS_DIR
+
     try:
         subprocess.check_call([py, "-m", "ensurepip", "--upgrade"])
     except Exception:
-        pass  # ok om ensurepip redan finns/inte behövs
-    # Bygg pip-kommandot
-    cmd = [py, "-m", "pip", "install", "dataspace_client", "-t", str(_LIBS_DIR)]
+        pass
+
+    cmd = [py, "-m", "pip", "install", "dataspace_client", "-t", str(libs)]
     if upgrade:
-        cmd.insert(4, "--upgrade")  # -> pip install --upgrade dataspace_client -t libs
-    # Kör installationen
-    subprocess.check_call(cmd)
-    # Ladda om importcacher
+        cmd.insert(4, "--upgrade")
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    print(res.stdout)
+    if res.returncode != 0:
+        print("[Dataspace] pip error:", res.stderr)
+        raise RuntimeError(res.stderr)
+
+    if str(libs) not in sys.path:
+        sys.path.insert(0, str(libs))
     importlib.invalidate_caches()
 
 # Försök importera; installera vid behov; försök igen.
@@ -174,23 +253,34 @@ def import_glb_bytes(data: bytes, select_import: bool = True, frame_view: bool =
 
 
 def _export_selected_to_glb_bytes(apply_modifiers: bool = True) -> Tuple[bytes, List[bpy.types.Object]]:
-    """Export selected objects to a temporary GLB file and return (bytes, exported_objects)."""
-    sel = [o for o in bpy.context.view_layer.objects if o.select_get() and o.type in {"MESH", "EMPTY", "ARMATURE", "CURVE", "SURFACE", "META", "FONT", "VOLUME"}]
+    """Export selected objects (and their children) to a temporary GLB file and return (bytes, exported_objects)."""
+    ctx = bpy.context
+    sel = [o for o in ctx.view_layer.objects if o.select_get() and o.type in {
+        "MESH", "EMPTY", "ARMATURE", "CURVE", "SURFACE", "META", "FONT", "VOLUME"
+    }]
     if not sel:
         raise RuntimeError("No selectable objects chosen. Select objects to export.")
+
+    # ✅ NEW: recursively add all children of selected objects
+    def gather_children(obj):
+        for c in obj.children:
+            yield c
+            yield from gather_children(c)
+    all_to_export = set(sel)
+    for o in sel:
+        all_to_export.update(gather_children(o))
 
     _ensure_gltf_addons()
 
     fd, tmp_path = tempfile.mkstemp(suffix=".glb")
     os.close(fd)
 
-    # Ensure only intended objects are exported
-    prev_selection = [o for o in bpy.context.selected_objects]
-    for o in bpy.context.selected_objects:
+    prev_selection = list(ctx.selected_objects)
+    for o in ctx.selected_objects:
         o.select_set(False)
-    for o in sel:
+    for o in all_to_export:
         o.select_set(True)
-    bpy.context.view_layer.objects.active = sel[0]
+    ctx.view_layer.objects.active = sel[0]
 
     try:
         res = bpy.ops.export_scene.gltf(
@@ -204,19 +294,20 @@ def _export_selected_to_glb_bytes(apply_modifiers: bool = True) -> Tuple[bytes, 
         with open(tmp_path, 'rb') as f:
             payload = f.read()
     finally:
-        # Restore selection
-        for o in bpy.context.selected_objects:
+        # restore selection
+        for o in ctx.selected_objects:
             o.select_set(False)
         for o in prev_selection:
             o.select_set(True)
         if prev_selection:
-            bpy.context.view_layer.objects.active = prev_selection[0]
+            ctx.view_layer.objects.active = prev_selection[0]
         try:
             os.remove(tmp_path)
         except Exception:
             pass
 
-    return payload, list(sel)
+    return payload, list(all_to_export)
+
 
 
 # ---------------------------------
@@ -393,11 +484,14 @@ def datahub_on_entry_click(wm, context):
     if op is None:
         return
 
-    if getattr(op, "_suppress_clicks", 0) > 0:
-        op._suppress_clicks -= 1
-        op._last_click_idx = -1
-        op._last_click_time = 0.0
-        return
+    try:
+        if getattr(op, "_suppress_clicks", 0) > 0:
+            op._suppress_clicks -= 1
+            op._last_click_idx = -1
+            op._last_click_time = 0.0
+            return
+    except Exception:
+        pass
 
     idx = context.window_manager.datahub_entry_index
     now = monotonic()
@@ -741,6 +835,90 @@ class DATAHUB_OT_publish_now(bpy.types.Operator):
 # -----------------------
 
 class DATAHUB_OT_publish_back_now(bpy.types.Operator):
+    """Publish the topmost ancestor (with same datahub_url) of the active object
+    back to its stored datahub_url. Overwrites the source file.
+    """
+    bl_idname = "datahub.publish_back_now"
+    bl_label = "Dataspace: Quick Publish Back to Source"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    apply_modifiers: bpy.props.BoolProperty(name="Apply Modifiers", default=True)
+
+    def _find_source_url(self, obj: bpy.types.Object) -> str:
+        return str(obj.get(DATAHUB_URL_PROP)) if obj and DATAHUB_URL_PROP in obj.keys() else ""
+
+    def _find_top_ancestor_with_same_url(self, obj: bpy.types.Object, url: str) -> bpy.types.Object:
+        """Walk up the parent chain as long as parent also has same datahub_url."""
+        top = obj
+        while top.parent and self._find_source_url(top.parent) == url:
+            top = top.parent
+        return top
+
+    def execute(self, context):
+        ctx = context
+        obj = ctx.view_layer.objects.active
+        url = self._find_source_url(obj)
+
+        # fallback: check any selected object
+        if not url:
+            for o in ctx.selected_objects:
+                url = self._find_source_url(o)
+                if url:
+                    obj = o
+                    break
+
+        if not obj or not url:
+            self.report({'ERROR'}, "No object with datahub_url selected")
+            return {'CANCELLED'}
+
+        # climb to the top node of imported hierarchy
+        top_obj = self._find_top_ancestor_with_same_url(obj, url)
+        if top_obj != obj:
+            print(f"[Dataspace] Using top-level parent '{top_obj.name}' for publish (shared URL).")
+
+        folder, fname = _split_folder_and_name_from_url(url)
+        if not folder or not fname:
+            self.report({'ERROR'}, "Stored URL is not a file path")
+            return {'CANCELLED'}
+        if not fname.lower().endswith('.glb'):
+            fname += '.glb'
+
+        if not _ensure_credentials_for_url(folder):
+            self.report({'INFO'}, "Add credentials and retry quick publish.")
+            return {'CANCELLED'}
+
+        prev_sel = list(ctx.selected_objects)
+        prev_active = ctx.view_layer.objects.active
+
+        try:
+            for o in prev_sel:
+                o.select_set(False)
+            top_obj.select_set(True)
+            ctx.view_layer.objects.active = top_obj
+
+            payload, _ = _export_selected_to_glb_bytes(self.apply_modifiers)
+            target_path = _join_mqtt_path(folder, fname)
+            datahub.Publish(target_path, payload)
+            try:
+                top_obj[DATAHUB_URL_PROP] = target_path
+            except Exception:
+                pass
+            self.report({'INFO'}, f"Quick published top node '{top_obj.name}' to {fname}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Quick publish failed: {e}")
+            return {'CANCELLED'}
+        finally:
+            # restore selection
+            for o in ctx.selected_objects:
+                o.select_set(False)
+            for o in prev_sel:
+                o.select_set(True)
+            if prev_active:
+                ctx.view_layer.objects.active = prev_active
+
+
+class old_DATAHUB_OT_publish_back_now(bpy.types.Operator):
     """Publish the ACTIVE object's geometry back to its stored datahub_url without any dialog.
     Overwrites the source file. Requires the active (or any selected) object to have 'datahub_url'.
     Also refreshes that property to the target after publish.
