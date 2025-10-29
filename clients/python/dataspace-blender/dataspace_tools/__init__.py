@@ -92,6 +92,99 @@ def handle_mqtt_folder_paste(clip: str):
 # ✅ NEW — handle folders
 smartpaste.register_handler(["mqtt://*/", "mqtts://*/"], handle_mqtt_folder_paste)
 
+# --- FUNKTION: visa text i texteditor (oförändrad hjälpfunktion) ---
+import bpy
+import builtins
+
+def open_text_in_scripting(name="Exempeltext.py", content="# Ny text\n", dataspace_url=None):
+    """Create/update a Text datablock, switch to the Scripting workspace,
+    and make it the active/selected text in the Script Editor without resizing windows."""
+    # 1) Create or reuse the text datablock
+    txt = bpy.data.texts.get(name) or bpy.data.texts.new(name)
+    txt.clear()
+    txt.from_string(content)
+    if dataspace_url is not None:
+        txt["dataspace_url"] = dataspace_url
+
+    win = bpy.context.window
+
+    # 2) Switch to the Scripting workspace (doesn't resize, only changes layout)
+    ws = next((w for w in bpy.data.workspaces if w.name.lower() == "scripting"), None)
+    if ws:
+        win.workspace = ws
+    else:
+        # fallback: try activating scripting if missing
+        try:
+            bpy.ops.workspace.append_activate(idname="Scripting")
+            ws = bpy.context.window.workspace
+        except Exception:
+            ws = None
+
+    screen = win.screen
+
+    # 3) Find an existing Text Editor in the current layout
+    text_area = next((a for a in screen.areas if a.type == 'TEXT_EDITOR'), None)
+
+    # 4) If no Text Editor exists, reuse the current area (same size)
+    if text_area is None:
+        area = bpy.context.area or screen.areas[0]
+        area.type = 'TEXT_EDITOR'
+        text_area = area
+
+    # 5) Show the text and make it active/selected
+    space = text_area.spaces.active
+    if space.type != 'TEXT_EDITOR':
+        for sp in text_area.spaces:
+            if sp.type == 'TEXT_EDITOR':
+                space = sp
+                break
+    space.text = txt
+    text_area.spaces.active = space
+
+    # 6) Make available in console as `t`
+    builtins.t = txt
+
+    return txt
+
+
+
+# --- HUVUDFUNKTION ---
+def open_text_url_in_texteditor(url: str):
+    """Hämta text via dataspace.Get(url, handler=None) och öppna i Text Editor."""
+    print(f"[SmartPaste] Hämtar text från dataspace: {url}")
+
+    # Ensure credentials
+    if not _ensure_credentials_for_url(url, on_ready=lambda: open_text_url_in_texteditor(url)):
+        print("[SmartPaste] Saknar credentials – öppnar dialog och återupptar senare.")
+        return
+
+    try:
+        
+        # --- HÄMTNING ---
+        res = datahub.Get(url, handler=None)
+        # Om resultatet är bytes → dekoda
+        if isinstance(res, (bytes, bytearray)):
+            content = res.decode("utf-8", errors="replace")
+        elif isinstance(res, str):
+            content = res
+        elif isinstance(res, dict):
+            import json
+            content = json.dumps(res, indent=2, ensure_ascii=False)
+        else:
+            content = str(res)
+
+        # --- NAMN FRÅN URL (sista delen efter "/") ---
+        name = url.rsplit("/", 1)[-1] or "untitled.txt"
+
+        # --- VISA I SCRIPT EDITORN ---
+        open_text_in_scripting(name=name, content=content, dataspace_url=url)
+        print(f"[SmartPaste] Öppnade text i editor: {name}")
+
+    except Exception as e:
+        print(f"[SmartPaste] Fel vid dataspace.Get(): {e!r}")
+
+smartpaste.register_handler(["mqtt://*.txt", "mqtts://*.txt"], open_text_url_in_texteditor)
+smartpaste.register_handler(["mqtt://*.json", "mqtts://*.json"], open_text_url_in_texteditor)
 
 ADDON_DIR = os.path.dirname(__file__)
 MODULES_DIR = os.path.join(ADDON_DIR, "modules")
