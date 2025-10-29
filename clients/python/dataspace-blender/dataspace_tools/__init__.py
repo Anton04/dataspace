@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Dataspace GLB Tools",
     "author": "Anton + ChatGPT",
-    "version": (0, 6, 2),  # UI rename to Dataspace; set datahub_url on publish; quick publish; creds dialog kept
-    "blender": (3, 0, 0),
+    "version": (0, 6, 3),  # UI rename to Dataspace; set datahub_url on publish; quick publish; creds dialog kept
+    "blender": (4, 5, 0),
     "location": "3D Viewport > N-panel > Dataspace; File > Import/Export",
     "description": "Browse Dataspace folders, import remote GLB, and publish selected objects as GLB",
     "category": "Import-Export",
@@ -14,6 +14,55 @@ import os
 import tempfile
 import addon_utils
 from typing import List, Tuple, Iterable
+
+# --- DEPENDENCY BUTTON (short + self-contained) ------------------------------
+import os, sys
+import bpy
+
+ADDON_DIR = os.path.dirname(__file__)
+MODULES_DIR = os.path.join(ADDON_DIR, "modules")
+if os.path.isdir(MODULES_DIR) and MODULES_DIR not in sys.path:
+    sys.path.insert(0, MODULES_DIR)
+
+
+class DATASPACETOOLS_Preferences(bpy.types.AddonPreferences):
+    bl_idname = __name__  # eller "dataspace_tools" om ditt paketnamn är fixerat
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.label(text="Beroenden")
+        col.operator("dataspace_tools.install_deps", icon="CONSOLE")
+
+
+class DATASPACETOOLS_OT_InstallDeps(bpy.types.Operator):
+    bl_idname = "dataspace_tools.install_deps"
+    bl_label = "Installera beroenden"
+    bl_description = "Installerar Python-paket i add-onens lokala 'modules'"
+
+    def execute(self, context):
+        try:
+            from .deps import ensure_deps
+        except Exception as e:
+            self.report({'ERROR'}, f"Kunde inte importera deps: {e}")
+            return {'CANCELLED'}
+
+        ok, msg = ensure_deps(
+            target_dir=MODULES_DIR,
+            requirements=[
+                # Lägg dina paket här, pinna gärna versioner
+                "dataspace_client",  # ex.
+                # "paho-mqtt==2.1.0",
+            ],
+        )
+        self.report({'INFO' if ok else 'ERROR'}, msg)
+        return {'FINISHED'}
+
+# Registrera klasserna
+_classes_deps = (
+    DATASPACETOOLS_Preferences,
+    DATASPACETOOLS_OT_InstallDeps,
+)
 
 
 # --- Bootstrap: importera DataHub, annars installera dataspace_client och försök igen ---
@@ -1046,6 +1095,13 @@ classes = (
 )
 
 def register():
+
+    for _C in _classes_deps:
+        try:
+            bpy.utils.register_class(_C)
+        except Exception:
+            pass
+            
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
@@ -1078,6 +1134,12 @@ def unregister():
         except Exception:
             pass
 
+    for _C in reversed(_classes_deps):
+        try:
+            bpy.utils.unregister_class(_C)
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     try:
@@ -1094,3 +1156,4 @@ if __name__ == "__main__":
             print(f" - {name}: {fullp}")
     except Exception as e:
         print("Listing failed:", e)
+
