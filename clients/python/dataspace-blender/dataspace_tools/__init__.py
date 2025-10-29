@@ -18,6 +18,8 @@ from typing import List, Tuple, Iterable
 # --- DEPENDENCY BUTTON (short + self-contained) ------------------------------
 import os, sys
 import bpy
+from . import helpers
+from . import sync_registry
 
 # SmartPaste functionality for easier code pasting
 from . import smartpaste
@@ -36,8 +38,8 @@ def handle_mqtt_url_paste(clip: str):
     print(f"[SmartPaste] Hanterar MQTT-URL från urklipp: {clip!r}")
 
     # ensure credentials
-    if not _ensure_credentials_for_url(clip):
-        print("[SmartPaste] Saknar credentials – öppnar dialog...")
+    if not _ensure_credentials_for_url(clip, on_ready=lambda: handle_mqtt_url_paste(clip)):
+        print("[SmartPaste] Saknar credentials – öppnar dialog och återupptar senare.")
         return
 
     # try import
@@ -77,8 +79,8 @@ def handle_mqtt_folder_paste(clip: str):
     print(f"[SmartPaste] Opening import dialog for folder: {clip}")
 
     # Ensure credentials
-    if not _ensure_credentials_for_url(clip):
-        print("[SmartPaste] Missing credentials — opening dialog...")
+    if not _ensure_credentials_for_url(clip, on_ready=lambda: handle_mqtt_folder_paste(clip)):
+        print("[SmartPaste] Saknar credentials – öppnar dialog och återupptar senare.")
         return
 
     try:
@@ -211,7 +213,8 @@ def _ensure_gltf_addons():
             pass
 
 
-def import_glb_bytes(data: bytes, select_import: bool = True, frame_view: bool = True) -> List[bpy.types.Object]:
+def import_glb_bytes(data: bytes, select_import: bool = True, frame_view: bool = True, source_url: str = "") -> List[bpy.types.Object]:
+
     """Import GLB binary bytes into the current scene and return created objects."""
     _ensure_gltf_addons()
 
@@ -230,6 +233,26 @@ def import_glb_bytes(data: bytes, select_import: bool = True, frame_view: bool =
     # New objects
     new_objs = [o for o in bpy.data.objects if o not in prev]
 
+    # --- find top-level nodes (no parent or parent not imported)
+    imported_set = set(new_objs)
+    top_nodes = [o for o in new_objs if not o.parent or o.parent not in imported_set]
+
+    # 🟩 NYTT: Märk importerade objekt
+    try:
+        for o in new_objs:
+            helpers.set_import_metadata(o, url=source_url or "", with_mesh_hash=True)
+            #sync_registry.register_sync(o, source_url)
+    except Exception as e:
+        print(f"[Dataspace] Warning: could not mark import metadata: {e}")
+
+    try:
+        for o in top_nodes:
+            sync_registry.register_sync(o, source_url)
+
+        sync_registry.print_registry()
+    except Exception as e:
+        print(f"[Dataspace] Warning: could not register sync: {e}")
+
     # Optional selection + frame
     if select_import and new_objs:
         for o in bpy.context.selected_objects:
@@ -243,6 +266,9 @@ def import_glb_bytes(data: bytes, select_import: bool = True, frame_view: bool =
             except Exception:
                 pass
 
+
+    
+
     # Cleanup temp
     try:
         os.remove(glb_path)
@@ -252,8 +278,17 @@ def import_glb_bytes(data: bytes, select_import: bool = True, frame_view: bool =
     return new_objs
 
 
-def _export_selected_to_glb_bytes(apply_modifiers: bool = True) -> Tuple[bytes, List[bpy.types.Object]]:
-    """Export selected objects (and their children) to a temporary GLB file and return (bytes, exported_objects)."""
+def _export_selected_to_glb_bytes(
+    apply_modifiers: bool = True,
+    target_url: str | None = None
+) -> Tuple[bytes, List[bpy.types.Object]]:
+    """Export selected objects (and their children) to a temporary GLB file and return (bytes, exported_objects).
+
+    If target_url is given, each exported object will be tagged with:
+        - datahub_url property
+        - refreshed transform + mesh signature
+    """
+
     ctx = bpy.context
     sel = [o for o in ctx.view_layer.objects if o.select_get() and o.type in {
         "MESH", "EMPTY", "ARMATURE", "CURVE", "SURFACE", "META", "FONT", "VOLUME"
@@ -261,7 +296,7 @@ def _export_selected_to_glb_bytes(apply_modifiers: bool = True) -> Tuple[bytes, 
     if not sel:
         raise RuntimeError("No selectable objects chosen. Select objects to export.")
 
-    # ✅ NEW: recursively add all children of selected objects
+    # --- recursively gather children ---
     def gather_children(obj):
         for c in obj.children:
             yield c
@@ -270,8 +305,12 @@ def _export_selected_to_glb_bytes(apply_modifiers: bool = True) -> Tuple[bytes, 
     for o in sel:
         all_to_export.update(gather_children(o))
 
+
+    #TODO sync_registry.register_sync(o, target_url) on top nodes    
+
     _ensure_gltf_addons()
 
+    # --- create temp GLB path ---
     fd, tmp_path = tempfile.mkstemp(suffix=".glb")
     os.close(fd)
 
@@ -291,22 +330,43 @@ def _export_selected_to_glb_bytes(apply_modifiers: bool = True) -> Tuple[bytes, 
         )
         if res != {'FINISHED'}:
             raise RuntimeError("GLB export did not finish successfully")
+
         with open(tmp_path, 'rb') as f:
             payload = f.read()
+
+        #Print the length of the payload for debugging
+        print(f"[Dataspace] Exported GLB size: {len(payload)} bytes")
+
+        #Print publising to target_url
+        if target_url:
+            print(f"[Dataspace] Publishing to: {target_url}")
+        else:
+            print(f"[Dataspace] No target URL provided for publishing.")
+
+        datahub.Publish(target_url, payload)
+
+        # --- NEW: tag exported objects with url + hash ---
+        try:
+            if target_url:
+              helpers.set_published_metadata_recursive(all_to_export, target_url)
+        except Exception as e:
+            print(f"[Dataspace] Warning: could not set publish metadata: {e}")
+
     finally:
-        # restore selection
+        # --- restore previous selection ---
         for o in ctx.selected_objects:
             o.select_set(False)
         for o in prev_selection:
             o.select_set(True)
         if prev_selection:
             ctx.view_layer.objects.active = prev_selection[0]
+
         try:
             os.remove(tmp_path)
         except Exception:
             pass
 
-    return payload, list(all_to_export)
+    return list(all_to_export)
 
 
 
@@ -370,21 +430,36 @@ def _parent_folder(path: str) -> str:
     return '/'
 
 
-def _ensure_credentials_for_url(url: str) -> bool:
-    """If server hasn't been added yet, prompt user to add credentials.
-    Returns True if credentials are (assumed) present; False if we just opened a dialog.
-    NOTE: This may open behind another dialog in some Blender versions; users can use the ➕ button to add creds explicitly.
+# --- Globalt minne för väntande åtgärd (resume efter inloggning) ---
+_PENDING_AFTER_CREDS = None
+
+
+def _ensure_credentials_for_url(url: str, on_ready: callable = None) -> bool:
+    """Ensure credentials exist for given URL.
+    If missing, open credentials dialog and optionally remember a callback to resume later.
+    Returns True if credentials are already present, False if dialog opened.
     """
     base = _server_base_from_url(url)
     if not base:
         return True
+
+    # Already known server
     if base in _KNOWN_SERVERS:
         return True
-    # Prompt user to add creds (prefill server)
+
+    # Save pending callback and open credentials dialog
+    global _PENDING_AFTER_CREDS
+    _PENDING_AFTER_CREDS = on_ready
+
     try:
+        print(f"[Dataspace] No credentials for {base} – opening dialog.")
         bpy.ops.datahub.add_credentials('INVOKE_DEFAULT', server=base)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Dataspace] Could not open credentials dialog: {e}")
+        _PENDING_AFTER_CREDS = None
+        return False
+
+    # Return immediately – dialog is non-blocking
     return False
 
 
@@ -572,24 +647,30 @@ class DATAHUB_OT_add_credentials(bpy.types.Operator):
 
     def execute(self, context):
         base = _server_base_from_url(self.server)
-        if not base:
-            self.report({'ERROR'}, "Invalid server")
-            return {'CANCELLED'}
-        try:
-            datahub.add_credentials(base, self.username, self.password)
-            _KNOWN_SERVERS.add(base)
-            op = _active_dialog()
-            if op:
-                try:
-                    op._refresh_entries()
-                    bpy.ops.wm.redraw_timer(type='DRAW_WIN', iterations=1)
-                except Exception:
-                    pass
-            self.report({'INFO'}, f"Credentials added for {base}")
-            return {'FINISHED'}
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to add credentials: {e}")
-            return {'CANCELLED'}
+        datahub.add_credentials(base, self.username, self.password)
+        _KNOWN_SERVERS.add(base)
+
+        # Resume any pending action
+        global _PENDING_AFTER_CREDS
+        cb = _PENDING_AFTER_CREDS
+        _PENDING_AFTER_CREDS = None
+        if cb:
+            try:
+                print("[Dataspace] Resuming pending action after credentials...")
+                cb()
+            except Exception as e:
+                print(f"[Dataspace] Resume failed: {e}")
+
+        self.report({'INFO'}, f"Credentials added for {base}")
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        """Called when the dialog is closed with Esc or Cancel."""
+        global _PENDING_AFTER_CREDS
+        if _PENDING_AFTER_CREDS:
+            print("[Dataspace] Credentials dialog cancelled – clearing pending action.")
+            _PENDING_AFTER_CREDS = None
+
 
 
 class DATAHUB_OT_refresh_listing(bpy.types.Operator):
@@ -687,12 +768,12 @@ class DATAHUB_OT_import_selected(bpy.types.Operator):
             data = datahub.Get(item.path, handler=None)
             if not isinstance(data, (bytes, bytearray)):
                 raise TypeError("DataHub.Get did not return bytes for a file path")
-            new_objs = import_glb_bytes(data, op.select_import, op.frame_view)
-            for o in new_objs:
-                try:
-                    o[DATAHUB_URL_PROP] = item.path
-                except Exception:
-                    pass
+            new_objs = import_glb_bytes(data, op.select_import, op.frame_view,item.path)
+            #for o in new_objs:
+            #    try:
+            #        o[DATAHUB_URL_PROP] = item.path
+            #    except Exception:
+            #        pass
             try:
                 bpy.ops.wm.redraw_timer(type='DRAW_WIN', iterations=1)
             except Exception:
@@ -739,12 +820,12 @@ class DATAHUB_OT_open_or_import(bpy.types.Operator):
             data = datahub.Get(item.path, handler=None)
             if not isinstance(data, (bytes, bytearray)):
                 raise TypeError("DataHub.Get did not return bytes for a file path")
-            new_objs = import_glb_bytes(data, op.select_import, op.frame_view)
-            for o in new_objs:
-                try:
-                    o[DATAHUB_URL_PROP] = item.path
-                except Exception:
-                    pass
+            new_objs = import_glb_bytes(data, op.select_import, op.frame_view,item.path)
+            #for o in new_objs:
+            #    try:
+            #        o[DATAHUB_URL_PROP] = item.path
+            #    except Exception:
+            #        pass
             self.report({'INFO'}, f"Imported {len(new_objs)} objects from {item.name}")
             return {'FINISHED'}
         except Exception as e:
@@ -810,15 +891,10 @@ class DATAHUB_OT_publish_now(bpy.types.Operator):
         try:
             fname = self._target_fname or self._compute_target_name(op)
             folder = self._target_folder or op.folder_path
-            payload, exported_objs = _export_selected_to_glb_bytes(self._apply_mods)
             target_path = _join_mqtt_path(folder, fname)
-            datahub.Publish(target_path, payload)
-            # Set source on exported objects
-            for o in exported_objs:
-                try:
-                    o[DATAHUB_URL_PROP] = target_path
-                except Exception:
-                    pass
+            exported_objs = _export_selected_to_glb_bytes(apply_modifiers=True,target_url=target_path)
+        
+
             try:
                 op._refresh_entries()
             except Exception:
@@ -895,10 +971,9 @@ class DATAHUB_OT_publish_back_now(bpy.types.Operator):
                 o.select_set(False)
             top_obj.select_set(True)
             ctx.view_layer.objects.active = top_obj
-
-            payload, _ = _export_selected_to_glb_bytes(self.apply_modifiers)
             target_path = _join_mqtt_path(folder, fname)
-            datahub.Publish(target_path, payload)
+            exported_objs = _export_selected_to_glb_bytes(apply_modifiers=True,target_url=target_path)
+            
             try:
                 top_obj[DATAHUB_URL_PROP] = target_path
             except Exception:
@@ -918,75 +993,7 @@ class DATAHUB_OT_publish_back_now(bpy.types.Operator):
                 ctx.view_layer.objects.active = prev_active
 
 
-class old_DATAHUB_OT_publish_back_now(bpy.types.Operator):
-    """Publish the ACTIVE object's geometry back to its stored datahub_url without any dialog.
-    Overwrites the source file. Requires the active (or any selected) object to have 'datahub_url'.
-    Also refreshes that property to the target after publish.
-    """
-    bl_idname = "datahub.publish_back_now"
-    bl_label = "Dataspace: Quick Publish Back to Source"
-    bl_options = {'REGISTER', 'UNDO'}
 
-    apply_modifiers: bpy.props.BoolProperty(name="Apply Modifiers", default=True)
-
-    def _find_source_url(self, context) -> Tuple[bpy.types.Object, str]:
-        ctx = context
-        act = ctx.view_layer.objects.active
-        if act and DATAHUB_URL_PROP in act.keys():
-            return act, str(act.get(DATAHUB_URL_PROP))
-        for o in ctx.selected_objects:
-            if DATAHUB_URL_PROP in o.keys():
-                return o, str(o.get(DATAHUB_URL_PROP))
-        return None, ""
-
-    def execute(self, context):
-        obj, url = self._find_source_url(context)
-        if not obj or not url:
-            self.report({'ERROR'}, "Active/selected object has no datahub_url")
-            return {'CANCELLED'}
-        folder, fname = _split_folder_and_name_from_url(url)
-        if not folder or not fname:
-            self.report({'ERROR'}, "Stored URL is not a file path")
-            return {'CANCELLED'}
-        if not fname.lower().endswith('.glb'):
-            fname += '.glb'
-
-        if not _ensure_credentials_for_url(folder):
-            self.report({'INFO'}, "Add credentials and retry quick publish.")
-            return {'CANCELLED'}
-
-        ctx = context
-        prev_sel = list(ctx.selected_objects)
-        prev_active = ctx.view_layer.objects.active
-
-        try:
-            for o in prev_sel:
-                o.select_set(False)
-            obj.select_set(True)
-            ctx.view_layer.objects.active = obj
-
-            payload, _ = _export_selected_to_glb_bytes(self.apply_modifiers)
-            target_path = _join_mqtt_path(folder, fname)
-            datahub.Publish(target_path, payload)
-            try:
-                obj[DATAHUB_URL_PROP] = target_path
-            except Exception:
-                pass
-            self.report({'INFO'}, f"Quick published to {fname}")
-            return {'FINISHED'}
-        except Exception as e:
-            self.report({'ERROR'}, f"Quick publish failed: {e}")
-            return {'CANCELLED'}
-        finally:
-            try:
-                for o in ctx.selected_objects:
-                    o.select_set(False)
-                for o in prev_sel:
-                    o.select_set(True)
-                if prev_active:
-                    ctx.view_layer.objects.active = prev_active
-            except Exception:
-                pass
 
 
 # -----------------------
@@ -1054,7 +1061,9 @@ class DATAHUB_OT_import_remote_glb(bpy.types.Operator):
         self._last_click_time = 0.0
         self._suppress_clicks = 0
 
-        _ensure_credentials_for_url(self.folder_path)
+        if not _ensure_credentials_for_url(self.folder_path, on_ready=lambda: bpy.ops.datahub.import_remote_glb('INVOKE_DEFAULT')):
+            # Saknar creds → öppna dialog, återuppta senare
+            return {'CANCELLED'}
 
         self._refresh_entries()
         if bpy.app.version >= (4, 0, 0):
@@ -1183,7 +1192,9 @@ class DATAHUB_OT_publish_browse_glb(bpy.types.Operator):
         except Exception as e:
             print("[Dataspace] prefill error:", e)
 
-        _ensure_credentials_for_url(self.folder_path)
+        if not _ensure_credentials_for_url(self.folder_path, on_ready=lambda: bpy.ops.datahub.publish_browse_glb('INVOKE_DEFAULT')):
+            # Saknar creds → öppna dialog, återuppta senare
+            return {'CANCELLED'}
 
         self._refresh_entries()
         if bpy.app.version >= (4, 0, 0):

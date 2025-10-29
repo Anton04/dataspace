@@ -53,21 +53,48 @@ def import_glb_from_url(url: str):
 #  OPERATORER
 # ------------------------------------------------------------
 
+PRESENT_IN_INTERNAL = ""
+
 class VIEW3D_OT_smart_copy(bpy.types.Operator):
     """Töm systemclipboard innan vanlig kopiering i 3D-vyn"""
     bl_idname = "view3d.smart_copy"
     bl_label = "Smart Copy"
 
     def execute(self, context):
+        global PRESENT_IN_INTERNAL
         wm = context.window_manager
         wm.clipboard = ""
+        PRESENT_IN_INTERNAL = ""
         print("[SmartCopy] Clipboard rensad – kör copybuffer().")
+        
+        sel = context.selected_objects
+        print(f"[SmartCopy] Antal valda objekt i 3D vyn: {len(sel)}")
+        
         try:
             bpy.ops.view3d.copybuffer()
             print("[SmartCopy] Objekt kopierat till intern buffer.")
+
+            # Check if only one are selected and if it is a dataspace object
+            
+
+            if len(sel) > 0:
+                obj = sel[0]
+
+                # Kontrollera om objektet har dataspace-url
+                url = obj.get("datahub_url", None)
+
+                if url:
+                    # Kopiera till externa clipboarden
+                    wm.clipboard = url
+                    print(f"[SmartCopy] Objekt har datahub_url → Kopierat '{url}' till systemclipboard.")
+                    PRESENT_IN_INTERNAL = url
+
+                
         except Exception as e:
             print(f"[SmartCopy] Fel vid copybuffer(): {e!r}")
         return {'FINISHED'}
+    
+
 
 
 class VIEW3D_OT_smart_paste(bpy.types.Operator):
@@ -79,11 +106,20 @@ class VIEW3D_OT_smart_paste(bpy.types.Operator):
         wm = context.window_manager
         clip = (wm.clipboard or "").strip()
 
-        if not clip:
+        if not clip :
             print("[SmartPaste] Clipboard tomt → försöker klistra in objekt.")
             try:
                 bpy.ops.view3d.pastebuffer()
                 print("[SmartPaste] Objekt inklistrat.")
+            except Exception as e:
+                print(f"[SmartPaste] Fel vid pastebuffer(): {e!r}")
+            return {'FINISHED'}
+        
+        if clip == PRESENT_IN_INTERNAL:
+            print("[SmartPaste] Clipboard matchar intern buffer → klistrar in objekt.")
+            try:
+                bpy.ops.view3d.pastebuffer()
+                print("[SmartPaste] Objekt inklistrat från intern buffer.")
             except Exception as e:
                 print(f"[SmartPaste] Fel vid pastebuffer(): {e!r}")
             return {'FINISHED'}
@@ -97,7 +133,7 @@ class VIEW3D_OT_smart_paste(bpy.types.Operator):
                 matched_handler(clip)
             except Exception as e:
                 print(f"[SmartPaste] Fel i handler {matched_handler.__name__}: {e!r}")
-            wm.clipboard = ""
+            #wm.clipboard = ""
             return {'FINISHED'}
         # --- SLUT ÄNDRING ---
 
@@ -124,7 +160,7 @@ def register():
     except Exception:
         pass
 
-    
+
     bpy.utils.register_class(VIEW3D_OT_smart_copy)
     bpy.utils.register_class(VIEW3D_OT_smart_paste)
 
