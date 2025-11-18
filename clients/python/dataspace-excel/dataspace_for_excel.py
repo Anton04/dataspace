@@ -6,6 +6,8 @@ from fnmatch import fnmatch
 import os, tempfile
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
+import login_interface
+import figures
 
 # Single RtdServer shared by all topics
 _rtd_server = xlo.RtdServer()
@@ -13,10 +15,13 @@ _rtd_server = xlo.RtdServer()
 # Global DataHub client instance
 datahub = DataHub()
 
+login_interface.AddDataHub(datahub)
+
 # Add MQTT credentials
 #datahub.add_credentials("mqtt://iot.digivis.se", "test", "test")
 
-usercredentials = False
+
+
 
 # ---------- Handler registry ----------
 _FILE_HANDLERS = {}
@@ -41,6 +46,28 @@ def _handle_image(url, bindata, ext):
     return f"Inserted image from {url or '(no url)'} → {shp.Name}"
 
 # ---------- NEW: directory/topic handler ----------
+
+
+# Function to trigger start of cells calculations on load
+def test_cell_edit():
+    xl = xlo.app()
+    sheet = xl.ActiveSheet
+    rng = sheet.Range("A1")
+    
+    original = rng.Value         # 1. Läs originalvärdet
+    print("Original:", original)
+    
+    rng.Value = "TEMP VÄRDE"     # 2. Ändra cellen
+    print("Ändrade till TEMP")
+    
+    # ... valfri logik här ...
+    
+    rng.Value = original         # 3. Återställ
+    print("Återställt till original:", original)
+
+
+
+
 
 
 import json
@@ -76,7 +103,7 @@ def _handle_directory(url, bindata):
             name = str(entry)
 
         emoji = "📁" if isinstance(name, str) and name.endswith("/") else "📄"
-        return f"{emoji} {name}"
+        return f"{emoji} {name} "
 
     rows = []
     try:
@@ -98,8 +125,14 @@ def _handle_directory(url, bindata):
 
 
 
+# Existis in newer datahub versions and can be removed later
+def check_credentials(url: str):
+        global datahub
 
-
+        #Extract server adress from url
+        parsed_url = urlparse(url)
+        server_address = parsed_url.hostname
+        return datahub.credentials.get(server_address) != None
 
 
 # Defaults
@@ -119,14 +152,14 @@ def get_from_dataspace(url: str):
     - If URL ends with a registered extension (*.glb, *.jpg, *.png) -> use handler.
     - Otherwise, return decoded text or JSON pretty-printed if object.
     """
-    global usercredentials
+ 
 
     if not url:
         return "No URL provided"
 
     # --- Ensure credentials / login first ---
-    if not usercredentials:
-        return "Not logged in. Add credentials first with AddUserCredentials(server, username, password)."
+    if not check_credentials(url):
+        return "Not logged in. Add credentials server management tab."
 
    
 
@@ -460,21 +493,21 @@ def load_3d_model(model_path: str):
 
     return "Körd!"
 
-@xlo.func
-def AddUserCredentials(server: str, username:str,password:str):
-    global usercredentials
+# @xlo.func
+# def AddUserCredentials(server: str, username:str,password:str):
+#    
     
-    datahub.add_credentials(server, username, password)
+#     datahub.add_credentials(server, username, password)
 
-    #Bugfix: Reconnect to the server to apply the new credentials
-    #datahub.servers[server].reconnect()
+#     #Bugfix: Reconnect to the server to apply the new credentials
+#     #datahub.servers[server].reconnect()
 
-    usercredentials = True
-    print(f"Credentials added for {server}")
+#  
+#     print(f"Credentials added for {server}")
 
-    #Add timestamp to the credentials
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    return "Credentials added at " + timestamp
+#     #Add timestamp to the credentials
+#     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+#     return "Credentials added at " + timestamp
 
 @xlo.func
 def subscribe_livedata(topic: str):
@@ -485,10 +518,10 @@ def subscribe_livedata(topic: str):
     Example usage in Excel:
       =subscribe_livedata("mqtt://iot.digivis.se/datadirectory/TestArea/signalA")
     """
-    global usercredentials
 
-    if not usercredentials:
-        return "No credentials added"
+
+    if not check_credentials(topic):
+        return "No credentials found. Please use server management tab to add them."
 
     if topic == None or topic == "":
         return "No topic specified"
@@ -514,10 +547,10 @@ def publish_live_data(topic: str, payload: str,retain: bool=False):
       =publish_live_data("mqtt://iot.digivis.se/datadirectory/TestArea/signalA", "Hello World")
     """
 
-    global usercredentials
 
-    if not usercredentials:
-        return "No credentials added"
+
+    if not check_credentials(topic):
+        return "No credentials found. Please use server management tab to add them."
 
     if not topic:
         return "No topic specified"
@@ -605,17 +638,17 @@ class LiveDataPublisher(xlo.RtdPublisher):
 
         
 
-        print(f"Publishing data for {topic}: {decoded_payload}")
+        #print(f"Publishing data for {topic}: {decoded_payload}")
 
 
         if self._subtopic != None:
 
-            print(f"Subtopic: {self._subtopic}")
+            #print(f"Subtopic: {self._subtopic}")
             try:
                 json_payload = json.loads(payload)
-                print(f"JSON payload: {json_payload}")
+                #print(f"JSON payload: {json_payload}")
                 decoded_payload = json_payload[self._subtopic]
-                print(f"Decoded payload: {decoded_payload}")
+                #print(f"Decoded payload: {decoded_payload}")
             except Exception as e:
                 print(f"Error parsing JSON: {e}")
                 return
@@ -659,3 +692,6 @@ class LiveDataPublisher(xlo.RtdPublisher):
         Returns True if this publisher is finished and should be destroyed.
         """
         return not self._subscribed  # Returns True when unsubscribed
+
+import time
+
