@@ -8,6 +8,9 @@ from urllib.parse import urlparse
 from urllib.request import urlretrieve
 import login_interface
 import figures
+import hashlib
+
+
 
 # Single RtdServer shared by all topics
 _rtd_server = xlo.RtdServer()
@@ -17,33 +20,300 @@ datahub = DataHub()
 
 login_interface.AddDataHub(datahub)
 
+published_values = {}
+
 # Add MQTT credentials
 #datahub.add_credentials("mqtt://iot.digivis.se", "test", "test")
 
+@xlo.func
+def caller_address() -> str:
+    cell = xlo.Caller()
+    address = cell.address()   # MUST be called
+    return address
+
+@xlo.func
+def getcellname() -> str:
+    address = caller_address()
+    name = address.split("]")[-1]  # Ta bort ev. bladnamn
+    return name
 
 
+@xlo.func
+def stable_hash(data) -> str:
+    if isinstance(data, str):
+        data = data.encode("utf-8")  # gör om sträng → bytes
+    elif not isinstance(data, (bytes, bytearray)):
+        raise TypeError("stable_hash requires str or bytes")
+
+    return hashlib.sha256(data).hexdigest()
+
+#Create cash path
+@xlo.func
+def get_cache_path(url)-> str:
+
+    #Get fileending fex .glb .jpg etc
+    file_ending = url.rsplit(".", 1) if "." in url else ("", "")
+    file_ending = "." + file_ending[1] if len(file_ending) > 1 else ""
+   
+
+    #Create cache directory if not exists
+    cache_dir = os.path.join(tempfile.gettempdir(), "dataspace_cache")
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+
+    #Create long hash from url that can be used as filename
+    hash_name = str(stable_hash(url)) + file_ending
+    file_path = os.path.join(cache_dir, f"{hash_name}")
+    return file_path
+
+
+#  Cashe exists. Checks if the url is cashed already with the same content
+def cache_exists(url: str, bindata: bytes) -> bool:
+    file_path = get_cache_path(url)
+    return cache_file_exists(file_path, bindata)
+
+# Cashe exists. Checks if the file exists with the same content
+def cache_file_exists(file_path: str) -> bool:
+    return os.path.exists(file_path)
+
+# cashe exists.
+def cashe_exists(url: str) -> bool:
+    file_path = get_cache_path(url)
+    return cache_file_exists(file_path)
+
+# Check if cache file exists with same content
+def cache_file_matches(file_path: str, bindata: bytes) -> bool:
+    if os.path.exists(file_path):
+        #Check if same size
+        if os.path.getsize(file_path) == len(bindata):
+            #check if same content
+            with open(file_path, "rb") as f:
+                existing_data = f.read()
+            if existing_data == bindata:
+                return True
+    return False
+
+# Save cache file if we have the temp path and bindata
+def save_cache_file(file_path: str, bindata: bytes):
+    with open(file_path, "wb") as f:
+        f.write(bindata)
+
+# Cache the data from url with bindata
+def save_cashe(url: str, bindata: bytes):
+    file_path = get_cache_path(url)
+    save_cache_file(file_path, bindata)
+
+# Hjälpfunktion: hämtar DocumentProperties COM-objektet
+def _get_doc_props():
+    app_com = xlo.app().to_com()
+    wb = app_com.ActiveWorkbook
+    return wb.CustomDocumentProperties
+
+
+def _find_prop(props, key):
+    key_lower = key.lower()
+    for prop in props:
+        if prop.Name.lower() == key_lower:
+            return prop
+    return None
+
+
+@xlo.func
+def save_hash(hash_key: str, hash_value: str):
+    props = _get_doc_props()
+
+    # Finns redan?
+    existing = _find_prop(props, hash_key)
+    if existing:
+        existing.Value = hash_value
+        return f"Updated hash '{hash_key}'"
+
+    # Skapa ny (type 4 = string)
+    props.Add(hash_key, False, 4, hash_value)
+    return f"Saved hash '{hash_key}'"
+
+
+@xlo.func
+def load_hash(hash_key: str):
+    props = _get_doc_props()
+
+    existing = _find_prop(props, hash_key)
+    if existing:
+        return existing.Value
+
+    return "No hash saved"
+
+
+@xlo.func
+def get_hash_keys():
+    props = _get_doc_props()
+    return [prop.Name for prop in props]
+
+
+
+@xlo.func
+def checkworkbookhashandupdate(hash_key: str, hash_value: str) -> bool:
+    """
+    Return True if hash matches saved value. 
+    If different, update and return False.
+    """
+    saved_hash = load_hash(hash_key)
+
+    if saved_hash == hash_value:
+        return True
+
+    save_hash(hash_key, hash_value)
+    return False
 
 # ---------- Handler registry ----------
 _FILE_HANDLERS = {}
 def register_handler(pattern: str, func):
     _FILE_HANDLERS[pattern.lower()] = func
 
+
+#Find a figure by name
+def find_figures_by_name(name: str):
+    app = xlo.app()
+    existing_shapes = [shape for shape in app.ActiveSheet.Shapes if shape.Name == name]
+    return existing_shapes
+
 # ---------- Handlers ----------
 def _handle_glb(url, bindata):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
-    with open(tmp.name, "wb") as f:
-        f.write(bindata)
+    cell = xlo.Caller()
+
+    rng = cell.range
+    com_range = rng.to_com()
+
+    if com_range:
+        left = com_range.Left
+        top = com_range.Top + com_range.Height
+    else:
+        left = 60     # fallback värde
+        top = 60
+    width = 300
+    height = 300
+
+
+    tmp_path = get_cache_path(url)
+
+    hash = str(stable_hash(bindata))
+
+    hashmatch = checkworkbookhashandupdate(tmp_path, hash)
+
+    #save_hash(tmp_path, str(stable_hash(bindata)))
+
+    #Check if exist
+    #cash_exists = cache_file_exists(tmp_path)
+    #datauptodate =  cache_file_matches(tmp_path, bindata)
+    
+    #tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
+    
+    figurename = url + getcellname()
+    #Check if a shape with the same name already exists
+    existing_shapes = find_figures_by_name(figurename)
+
+    if existing_shapes:
+        if hashmatch:
+            return f"3D model shape '{url}' is already up to date."
+
+    save_cache_file(tmp_path, bindata)
     app = xlo.app()
-    shp = app.ActiveSheet.Shapes.Add3DModel(tmp.name, 60, 60, 300, 300)
+     
+    if existing_shapes:
+        for shape in existing_shapes:
+            #Save position and size
+            left = shape.Left
+            top = shape.Top
+            width = shape.Width
+            height = shape.Height
+            shape.Delete()
+
+            shp = app.ActiveSheet.Shapes.Add3DModel(tmp_path, left, top, width, height)
+            shp.Left = left
+            shp.Top = top
+            shp.Width = width
+            shp.Height = height
+            shp.Name = figurename
+        return f"Updated existing 3D model shape(s) with name '{url}'"
+      
+        #return f"3D model shape '{shape.Name}' updated."
+
+    shp = app.ActiveSheet.Shapes.Add3DModel(tmp_path, left, top, width, height)
+
+    shp.Name = figurename
     return f"Inserted 3D model from {url or '(no url)'} → {shp.Name}"
 
 def _handle_image(url, bindata, ext):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-    with open(tmp.name, "wb") as f:
-        f.write(bindata)
+
+    cell = xlo.Caller()
+
+    rng = cell.range
+    com_range = rng.to_com()
+
+    if com_range:
+        left = com_range.Left
+        top = com_range.Top + com_range.Height
+    else:
+        left = 60     # fallback värde
+        top = 60
+        
+    width = -1
+    height = -1
+
+
+    tmp_path = get_cache_path(url)
+
+    hash = str(stable_hash(bindata))
+
+    hashmatch = checkworkbookhashandupdate(tmp_path, hash)
+    
+    
+    figurename = url + getcellname()
+
+    #Check if a shape with the same name already exists
+    existing_shapes = find_figures_by_name(figurename)
+
+    if hashmatch and existing_shapes:
+        return f"Image '{url}' is already up to date. (hash match)"
+    
+    save_cache_file(tmp_path, bindata)
     app = xlo.app()
-    shp = app.ActiveSheet.Shapes.AddPicture(tmp.name, 0, -1, 60, 60, -1, -1)
+     
+    if existing_shapes:
+        for shape in existing_shapes:
+            #Save position and size
+            left = shape.Left
+            top = shape.Top
+            width = shape.Width
+            height = shape.Height
+            shape.Delete()
+
+            shp = app.ActiveSheet.Shapes.AddPicture(tmp_path,0,-1, left, top, width, height)
+            shp.Left = left
+            shp.Top = top
+            shp.Width = width
+            shp.Height = height
+            shp.Name = figurename
+        return f"Updated existing image shape(s) with name '{url}'"
+      
+        #return f"3D model shape '{shape.Name}' updated."
+
+    shp = app.ActiveSheet.Shapes.AddPicture(tmp_path,0,-1, left, top, width, height)
+
+    max_size = 300
+
+    if shp.Width > max_size or shp.Height > max_size:
+        scale_w = max_size / shp.Width
+        scale_h = max_size / shp.Height
+        scale = min(scale_w, scale_h)
+        shp.Width = shp.Width * scale
+        shp.Height = shp.Height * scale
+
+    shp.Name = figurename
     return f"Inserted image from {url or '(no url)'} → {shp.Name}"
+
+
+  
 
 # ---------- NEW: directory/topic handler ----------
 
@@ -144,6 +414,50 @@ register_handler("*.png",  lambda url, b: _handle_image(url, b, ".png"))
 
 
 # ---------- Main ----------
+
+@xlo.func
+def sync_data(topic:str,value = None):
+    """
+    Syncs the given range to force recalculation of RTD functions.
+    Useful when data updates are needed.
+    """
+
+    global published_values
+
+    if value is not None:
+        #Get adress of cell 
+        cell = xlo.Caller()
+        
+        if cell:
+            adress = cell.address()
+            if adress in published_values:
+                if published_values[adress] != value:
+                    published_values[adress] = value
+                    datahub.Publish(topic, value)
+                    return True
+
+        
+
+        #Check if exist i global variable
+
+    
+    if not check_credentials(topic):
+        return "No credentials found. Please use server management tab to add them."
+
+    if topic == None or topic == "":
+        return "No topic specified"
+
+    #if topic not in _publishers:
+    if _rtd_server.peek(topic) is None:
+
+        print(f"Creating LiveDataPublisher for {topic}")
+        pub = LiveDataPublisher(topic)
+        _rtd_server.start(pub)
+        _rtd_server.publish(topic, "NaN")
+
+    return _rtd_server.subscribe(topic)
+
+
 @xlo.func
 def get_from_dataspace(url: str):
     """
