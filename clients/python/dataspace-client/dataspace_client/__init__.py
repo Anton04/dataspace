@@ -266,6 +266,9 @@ class Broker:
         self.subscriptions = {}
         self.gets = []
 
+        self.broker = broker
+        self.port = port
+
         # Bind callbacks
         self.client.username_pw_set(username=user, password=passw)
         self.client.on_connect = self.on_connect
@@ -289,7 +292,8 @@ class Broker:
             if handler not in self.subscriptions[topic]:
                 self.subscriptions[topic].append(handler)
                 if topic in self.retained.keys() and callable(handler):
-                    handler(topic, self.retained[topic], True)
+                    prefix = "mqtt://"
+                    handler(prefix + self.broker + "/" + topic, self.retained[topic], True)
         else:
             self.subscriptions[topic] = [handler]
 
@@ -311,7 +315,8 @@ class Broker:
             if handler is None:
                 return get_obj.payload
             elif callable(get_obj.handler):
-                return get_obj.handler(topic, get_obj.payload,get_obj.private)
+                prefix = "mqtt://"
+                return get_obj.handler(prefix + self.broker + "/" + topic, get_obj.payload,get_obj.private)
 
         return None
 
@@ -361,7 +366,8 @@ class Broker:
             if topic in self.subscriptions:
                 for handler in self.subscriptions[topic]:
                     if callable(handler):
-                        handler(topic, msg.payload,private)
+                        prefix = "mqtt://"
+                        handler(prefix + self.broker + "/" + topic, msg.payload,private)
 
                     if (topic, handler) in self.gets:
                         to_be_unsubscribed.append((topic, handler))
@@ -439,6 +445,33 @@ class DataHub:
           server = server[len("mqtt://"):]
 
         self.credentials[server] = {"user": username, "password": password}
+
+    def delete_credentials(self, server):
+        """Delete stored credentials for a server.
+
+        Args:
+            server_url: Full URL like "mqtt://host[:port]" or "mqtts://host[:port]".
+        """
+
+        #Remove mqtt:// if it server starts with it
+        if server.find("mqtt://") == 0:
+          server = server[len("mqtt://"):]
+
+        if server in self.credentials:
+            del self.credentials[server]
+
+        #Check if server exists in servers and remove it
+        if server in self.servers:
+            del self.servers[server]
+    
+
+    #Take any adress and see if credentials exists for it return true/false
+    def get_credentials(self, url: str):
+
+        #Extract server adress from url
+        parsed_url = urlparse(url)
+        server_address = parsed_url.hostname
+        return self.credentials.get(server_address) != None
 
     def login(self, server: str, user: str,
               password: str | None = None, *, prompt_password: bool = True):
