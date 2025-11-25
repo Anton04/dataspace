@@ -22,6 +22,7 @@ import base64
 #import ipywidgets as widgets
 #from IPython.display import display, HTML
 import uuid
+from jsonpath_ng import parse as jsonpath_parse
 
 
 
@@ -68,61 +69,86 @@ lastpayload = None
 def default_handler(topic, payload, private):
     global lastpayload
     global scene
+
+    # Save last payload
     lastpayload = payload
+
+    # ---------------------------------------------------------
+    # 1. Detect payload type (Python object or binary)
+    # ---------------------------------------------------------
+    is_binary = isinstance(payload, (bytes, bytearray))
+    is_python = not is_binary  # JSONPath results or retained JSON objects
+
+    # ---------------------------------------------------------
+    # 2. DIRECTORY LISTING (python or json)
+    # ---------------------------------------------------------
+    if topic.endswith('/'):
+        # Case 1: payload is already a python object (list/dict)
+        if is_python:
+            entries = payload
+
+        # Case 2: payload is binary JSON representing list/dict
+        else:
+            try:
+                entries = json.loads(payload)
+            except Exception:
+                entries = None
+
+        if isinstance(entries, (list, dict)):
+            folder_emoji = "\U0001F4C1"
+            file_emoji   = "\U0001F4C4"
+
+            # If it's a dict we list only its keys
+            if isinstance(entries, dict):
+                entries = list(entries.keys())
+
+            print(f"{topic} (directory{' private' if private else ''})")
+            print("_" * len(topic))
+
+            for entry in entries:
+                if isinstance(entry, str) and entry.endswith('/'):
+                    print(f"{folder_emoji} {entry}")
+                else:
+                    print(f"{file_emoji} {entry}")
+            return
+
+    # ---------------------------------------------------------
+    # 3. If Python object (JSONPath output) → pretty print
+    # ---------------------------------------------------------
+    if is_python:
+        try:
+            print(json.dumps(payload, indent=2))
+        except:
+            print(payload)
+        return
+
+    # ---------------------------------------------------------
+    # 4. From here on: payload is binary (bytes)
+    # ---------------------------------------------------------
+
+    # JPG auto-preview
     if payload_is_jpg(payload):
         display(Image(payload))
         return
 
-    if private:
-      print(topic + " (private)")
-    else:
-      print(topic + " (public)")
-
+    # Print topic with private/public tag
+    print(topic + (" (private)" if private else " (public)"))
     print("_" * len(topic))
 
+    # ---------------------------------------------------------
+    # 5. GLB preview
+    # ---------------------------------------------------------
     try:
-      #Check if file has an glb ending
-        if topic[-4:] == ".glb":
-
-            #print("Is a GLB file!")
-
-            print("File size is:" + str(len(payload)))
-
+        if topic.lower().endswith(".glb"):
+            print("File size is: " + str(len(payload)))
             show_3d_model(payload)
-
-            #print("Showing scene")
-
-            # Alternatively, you can display it in a browser interactively
-            #scene.show(viewer='notebook')  # This will open the model in your browser
-
             return
+    except Exception:
+        traceback.print_exc()
 
-        # Check if the topic has a trailing slash
-        elif topic.endswith('/'):
-            #print("Topic has a trailing slash.\nListing entries in payload:\n")
-
-            # Folder and File Emojis using Unicode
-            folder_emoji = "\U0001F4C1"  # Folder emoji
-            file_emoji = "\U0001F4C4"    # File emoji
-
-            # Load the payload which contains the JSON data
-            entries = json.loads(payload)
-
-            # Iterate through each entry in the payload
-            for entry in entries:
-                # Check if the entry has a trailing slash
-                if entry.endswith('/'):
-                    print(f"{folder_emoji} {entry}")  # Print folder emoji for entries with a trailing slash
-                else:
-                    print(f"{file_emoji} {entry}")  # Print file emoji for entries without a trailing slash
-
-            return
-
-    except Exception as e:
-      # Print the traceback
-      traceback.print_exc()
-
-
+    # ---------------------------------------------------------
+    # 6. Try to pretty-print JSON
+    # ---------------------------------------------------------
     try:
         data = json.loads(payload)
         print(json.dumps(data, indent=2))
@@ -130,14 +156,21 @@ def default_handler(topic, payload, private):
     except:
         pass
 
+    # ---------------------------------------------------------
+    # 7. Try to print as UTF-8 string
+    # ---------------------------------------------------------
     try:
         print(payload.decode("utf-8"))
         return
     except:
         pass
 
+    # ---------------------------------------------------------
+    # 8. Fallback: raw bytes
+    # ---------------------------------------------------------
     print(payload)
     return
+
 
 
 
@@ -258,6 +291,7 @@ class Broker:
         self.default_timezone = pytz.timezone('Europe/Stockholm')
         self.retain = True
         self.retained = {}
+        self.retained_ts = {}
 
         self.debug_msg = []
         self.debug = False
@@ -265,6 +299,10 @@ class Broker:
 
         self.subscriptions = {}
         self.gets = []
+
+        # An update is an operation that will update a jsonpath as soon as we have full json. 
+        self.pending_updates = {}   # topic_root → [UpdateOperation, ...]
+
 
         self.broker = broker
         self.port = port
@@ -283,22 +321,177 @@ class Broker:
         for topic in self.subscriptions.keys():
             self.client.subscribe(topic)
 
+    class UpdateOperation:
+        def __init__(self, broker, topic_root, jsonpath, new_value, timeout=10):
+            self.broker = broker
+            self.topic_root = topic_root
+            self.jsonpath = jsonpath
+            self.new_value = new_value
+            self.deadline = time.time() + timeout
 
-    def Publish(self,topic, payload=None, qos=0, retain=False, properties=None):
-        self.client.publish(topic, payload, qos, retain, properties)
+        def handler(self, full_topic, payload, private):
+            # Only act on the correct topic
+            #if full_topic != self.topic_root:
+            #    return
+
+            # Timeout?
+            if time.time() > self.deadline:
+                self.cleanup()
+                return
+            
+            #Check if payload is null
+            if payload is None:
+                base = {}
+            else:
+                # Parse base JSON if we fail then dont proceed
+                try:
+                    base = json.loads(payload)
+                except Exception:
+                    self.cleanup()
+                    return
+
+            # Apply JSONPath update
+            try:
+                expr = jsonpath_parse(self.jsonpath)
+                expr.update(base, self.new_value)
+            except Exception:
+                # Silently ignore JSONPath problems
+                self.cleanup()
+                return
+
+            # Publish full updated JSON back to topic
+            new_json = json.dumps(base).encode("utf-8")
+            self.broker.client.publish(self.topic_root, new_json, qos=0, retain=False)
+
+            # After successful update → clean up
+            self.cleanup()
+
+        def cleanup(self):
+            # Remove from pending list
+            ops = self.broker.pending_updates.get(self.topic_root, [])
+            if self in ops:
+                ops.remove(self)
+            if not ops:
+                self.broker.pending_updates.pop(self.topic_root, None)
+
+            # Unsubscribe the temporary handler
+            try:
+                self.broker.Unsubscribe(self.topic_root, self.handler)
+            except:
+                pass
+
+
+    def Publish(self, topic, payload=None, qos=0, retain=False, properties=None, timeout=2):
+        # Split into topic + optional JSONPath
+        topic_root, jsonpath = self.parse_topic_jsonpath(topic)
+
+        # CASE 1: normal publish → no JSONPath
+        if not jsonpath:
+            self.client.publish(topic_root, payload, qos, retain, properties)
+            return
+
+        # CASE 2: JSONPath update request (NON-BLOCKING)
+
+        # Decode incoming payload → new_value
+        try:
+            if isinstance(payload, (bytes, bytearray)):
+                new_value = json.loads(payload)
+            else:
+                new_value = payload
+        except Exception:
+            if isinstance(payload, (bytes, bytearray)):
+                new_value = payload.decode("utf-8", errors="ignore")
+            else:
+                new_value = payload
+
+        # Create update operation
+        op = self.UpdateOperation(self, topic_root, jsonpath, new_value, timeout)
+
+        # Store operation
+        if topic_root not in self.pending_updates:
+            self.pending_updates[topic_root] = []
+        self.pending_updates[topic_root].append(op)
+
+        # Subscribe temporary handler
+        # It will fire *on the next message*, or retained value
+        self.Subscribe(topic_root, op.handler)
+
+
+
+    def parse_topic_jsonpath(self,url_path: str):
+        idx = url_path.rfind('$')
+
+        if idx == 0:
+            # Hela strängen är topic
+            return url_path, None
+
+        if idx <= 0:
+            # Ingen JSONPath → hela strängen är URL-sökvägen
+            return url_path, None
+
+        url = url_path[:idx]     # t.ex. "$private/test"
+        jsonpath = url_path[idx:]       # t.ex. "$object1.name"
+
+        return url, jsonpath
+
+
+    def ApplyJsonPath(self, payload, jsonpath):
+        # 1. Ingen JSONPath → returnera hela payload
+        if not jsonpath:
+            return payload
+        
+
+        try:
+            json_payload = json.loads(payload)
+        except Exception as e:
+            # Payload är inte giltig JSON → returnera None
+            return payload
+
+        try:
+            # 2. Kompilera JSONPath
+            expr = jsonpath_parse(jsonpath)
+
+            # 3. Utför matchning
+            matches = expr.find(json_payload)
+
+            # 4. Ingen träff → returnera None
+            if not matches:
+                return None
+
+            # 5. Om det bara finns en träff → returnera värdet
+            if len(matches) == 1:
+                return matches[0].value
+
+            # 6. Flera träffar → returnera en lista av värden
+            return [m.value for m in matches]
+
+        except Exception as e:
+            # JSONPath-fel → returnera None
+            return None
 
     def Subscribe(self, topic, handler=default_handler):
+
+        topic, jsonpath = self.parse_topic_jsonpath(topic)
+
         if topic in self.subscriptions.keys():
-            if handler not in self.subscriptions[topic]:
-                self.subscriptions[topic].append(handler)
-                if topic in self.retained.keys() and callable(handler):
+            if (handler, jsonpath) not in self.subscriptions[topic]:
+                self.subscriptions[topic].append((handler, jsonpath))
+                retained_payload = self.get_retained(topic)
+                if retained_payload and callable(handler):
                     prefix = "mqtt://"
-                    handler(prefix + self.broker + "/" + topic, self.retained[topic], True)
+                    payload = self.ApplyJsonPath(retained_payload, jsonpath)
+                    handler(prefix + self.broker + "/" + topic, payload, True)
         else:
-            self.subscriptions[topic] = [handler]
+            self.subscriptions[topic] = [(handler, jsonpath)]
 
         self.client.subscribe(topic)
         self.client.subscribe(f"$private/{self.client_id}/{topic}")
+
+    #If there is a retained message for the topic return it
+    def get_retained(self, topic):
+        if topic in self.retained.keys():
+            return self.retained[topic]
+        return None
 
 
     def Get(self, topic, blocking=True, handler=default_handler, timeout=10):
@@ -334,11 +527,13 @@ class Broker:
         return df
 
     def Unsubscribe(self, topic, handler=default_handler):
+        topic, jsonpath = self.parse_topic_jsonpath(topic)
+
         if topic not in self.subscriptions:
             return
-        if handler not in self.subscriptions[topic]:
+        if (handler, jsonpath) not in self.subscriptions[topic]:
             return
-        self.subscriptions[topic].remove(handler)
+        self.subscriptions[topic].remove((handler, jsonpath))
         if len(self.subscriptions[topic]) == 0:
             self.client.unsubscribe(topic)
             self.client.unsubscribe(f"$private/{self.client_id}/{topic}")
@@ -351,8 +546,7 @@ class Broker:
                 self.debug_msg.append(f"{int(time.time())} Update received: {msg.topic}")
                 self.debug_msg = self.debug_msg[-10:]
 
-            if self.retain:
-                self.retained[msg.topic] = msg.payload
+            
 
             to_be_unsubscribed = []
 
@@ -363,11 +557,18 @@ class Broker:
                topic = msg.topic
                private = False
 
+            if self.retain:
+                self.retained[topic] = msg.payload
+                self.retained_ts[topic] = int(time.time())
+
             if topic in self.subscriptions:
-                for handler in self.subscriptions[topic]:
+                for (handler, jsonpath) in self.subscriptions[topic]:
+
+                    msg_payload = self.ApplyJsonPath(msg.payload, jsonpath)
+
                     if callable(handler):
                         prefix = "mqtt://"
-                        handler(prefix + self.broker + "/" + topic, msg.payload,private)
+                        handler(prefix + self.broker + "/" + topic, msg_payload,private)
 
                     if (topic, handler) in self.gets:
                         to_be_unsubscribed.append((topic, handler))
