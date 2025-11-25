@@ -23,14 +23,22 @@ import base64
 #from IPython.display import display, HTML
 import uuid
 from jsonpath_ng import parse as jsonpath_parse
-
+from enum import Enum
 
 
 __all__ = ["DataHub", "datahub", "__version__"]
 __version__ = "0.1.3.15"
 
+#Enum that describes 3 states 0 public, 1 private, 2 cached data
+class message_type(Enum):
+    PUBLIC = 0
+    PRIVATE = 1
+    RETAINED = 2
+    CACHED = 3
+    PENDING_UPDATE = 4
 
-
+    def __str__(self):
+        return self.name
 
 
 
@@ -66,7 +74,7 @@ def payload_is_jpg(data):
 
 lastpayload = None
 
-def default_handler(topic, payload, private):
+def default_handler(topic, payload, msg_type: message_type):
     global lastpayload
     global scene
 
@@ -102,7 +110,7 @@ def default_handler(topic, payload, private):
             if isinstance(entries, dict):
                 entries = list(entries.keys())
 
-            print(f"{topic} (directory{' private' if private else ''})")
+            print(f"{topic} (directory{' ' + str(msg_type) if msg_type else ''})")
             print("_" * len(topic))
 
             for entry in entries:
@@ -131,8 +139,8 @@ def default_handler(topic, payload, private):
         display(Image(payload))
         return
 
-    # Print topic with private/public tag
-    print(topic + (" (private)" if private else " (public)"))
+    # Print topic with private/public/cached tag
+    print(topic + " " + str(msg_type) )
     print("_" * len(topic))
 
     # ---------------------------------------------------------
@@ -272,11 +280,11 @@ class GetObject():
         self.topic = topic
         self.payload = None
         self.handler = handler or self.update
-        self.private = None
+        self.msg_type = None
 
-    def update(self, topic, payload,private):
+    def update(self, topic, payload, msg_type: message_type):
         self.payload = payload
-        self.private = private
+        self.msg_type = msg_type
         self.event.set()
 
 class Broker:
@@ -289,9 +297,10 @@ class Broker:
 
         self.basepath = basepath
         self.default_timezone = pytz.timezone('Europe/Stockholm')
-        self.retain = True
-        self.retained = {}
-        self.retained_ts = {}
+        self.cache = True
+        self.cached = {}
+        self.cached_ts = {}
+        self.cached_msg_type = {}
 
         self.debug_msg = []
         self.debug = False
@@ -329,7 +338,7 @@ class Broker:
             self.new_value = new_value
             self.deadline = time.time() + timeout
 
-        def handler(self, full_topic, payload, private):
+        def handler(self, full_topic, payload, msg_type: message_type):
             # Only act on the correct topic
             #if full_topic != self.topic_root:
             #    return
@@ -343,11 +352,18 @@ class Broker:
             if payload is None:
                 base = {}
             else:
-                # Parse base JSON if we fail then dont proceed
+                #Check if payload is already a python object else parse json
                 try:
-                    base = json.loads(payload)
+
+                    if not isinstance(payload, (dict, list)):
+                        base = json.loads(payload)
+                    else:
+                        base = payload
+
+
                 except Exception:
                     self.cleanup()
+                    print("JSON update operation failed: could not parse existing data: " + str(payload))
                     return
 
             # Apply JSONPath update
@@ -362,6 +378,7 @@ class Broker:
             # Publish full updated JSON back to topic
             new_json = json.dumps(base).encode("utf-8")
             self.broker.client.publish(self.topic_root, new_json, qos=0, retain=False)
+            self.broker.cache_payload(self.topic_root, new_json, msg_type=message_type.PENDING_UPDATE)
 
             # After successful update → clean up
             self.cleanup()
@@ -387,7 +404,14 @@ class Broker:
 
         # CASE 1: normal publish → no JSONPath
         if not jsonpath:
+
+            #Check if payload is text or binary otherwise convert to utf-8 if it is object to json.dumps
+
+            if not isinstance(payload, (str, bytes, bytearray)):
+                payload = json.dumps(payload).encode("utf-8")
+
             self.client.publish(topic_root, payload, qos, retain, properties)
+            self.cache_payload(topic_root, payload, msg_type=message_type.PENDING_UPDATE)
             return
 
         # CASE 2: JSONPath update request (NON-BLOCKING)
@@ -413,7 +437,7 @@ class Broker:
         self.pending_updates[topic_root].append(op)
 
         # Subscribe temporary handler
-        # It will fire *on the next message*, or retained value
+        # It will fire *on the next message*, or cached value
         self.Subscribe(topic_root, op.handler)
 
 
@@ -476,21 +500,20 @@ class Broker:
         if topic in self.subscriptions.keys():
             if (handler, jsonpath) not in self.subscriptions[topic]:
                 self.subscriptions[topic].append((handler, jsonpath))
-                retained_payload = self.get_retained(topic)
-                if retained_payload and callable(handler):
+                cached_payload = self.get_cached(topic)
+                if cached_payload and callable(handler):
                     prefix = "mqtt://"
-                    payload = self.ApplyJsonPath(retained_payload, jsonpath)
-                    handler(prefix + self.broker + "/" + topic, payload, True)
+                    payload = self.ApplyJsonPath(cached_payload, jsonpath)
+                    handler(prefix + self.broker + "/" + topic, payload, message_type.CACHED)
         else:
             self.subscriptions[topic] = [(handler, jsonpath)]
+            self.client.subscribe(topic)
+            self.client.subscribe(f"$private/{self.client_id}/{topic}")
 
-        self.client.subscribe(topic)
-        self.client.subscribe(f"$private/{self.client_id}/{topic}")
-
-    #If there is a retained message for the topic return it
-    def get_retained(self, topic):
-        if topic in self.retained.keys():
-            return self.retained[topic]
+    #If there is a cached message for the topic return it
+    def get_cached(self, topic):
+        if topic in self.cached.keys():
+            return self.cached[topic]
         return None
 
 
@@ -509,7 +532,7 @@ class Broker:
                 return get_obj.payload
             elif callable(get_obj.handler):
                 prefix = "mqtt://"
-                return get_obj.handler(prefix + self.broker + "/" + topic, get_obj.payload,get_obj.private)
+                return get_obj.handler(prefix + self.broker + "/" + topic, get_obj.payload,get_obj.msg_type)
 
         return None
 
@@ -539,6 +562,13 @@ class Broker:
             self.client.unsubscribe(f"$private/{self.client_id}/{topic}")
             del self.subscriptions[topic]
 
+
+    def cache_payload(self, topic, payload,msg_type: message_type = message_type.PUBLIC):
+        if self.cache:
+            self.cached[topic] = payload
+            self.cached_ts[topic] = int(time.time())
+            self.cached_msg_type[topic] = msg_type
+
     def on_message(self, client, userdata, msg):
         try:
             if self.debug:
@@ -551,15 +581,17 @@ class Broker:
             to_be_unsubscribed = []
 
             if msg.topic.find(f"$private/{self.client_id}/") == 0:
-               topic = msg.topic[len(f"$private/{self.client_id}/"):]
-               private = True
+                topic = msg.topic[len(f"$private/{self.client_id}/"):]
+                msg_type = message_type.PRIVATE
             else:
-               topic = msg.topic
-               private = False
+                topic = msg.topic
 
-            if self.retain:
-                self.retained[topic] = msg.payload
-                self.retained_ts[topic] = int(time.time())
+                if msg.retain == 1:
+                   msg_type = message_type.RETAINED
+                else:               
+                    msg_type = message_type.PUBLIC
+
+            self.cache_payload(topic, msg.payload,msg_type=msg_type)
 
             if topic in self.subscriptions:
                 for (handler, jsonpath) in self.subscriptions[topic]:
@@ -568,7 +600,7 @@ class Broker:
 
                     if callable(handler):
                         prefix = "mqtt://"
-                        handler(prefix + self.broker + "/" + topic, msg_payload,private)
+                        handler(prefix + self.broker + "/" + topic, msg_payload,msg_type)
 
                     if (topic, handler) in self.gets:
                         to_be_unsubscribed.append((topic, handler))
@@ -836,10 +868,10 @@ class DataHub:
         dyn.create_client(username, password, textname=fullname or username)
         dyn.add_client_role(username, rolename, priority=1)
 
-        # 3) skriv namn i din datastruktur (retained)
+        # 3) skriv namn i din datastruktur (non retained)
         if create_user_dir and fullname:
             payload = json.dumps({"default": fullname}).encode("utf-8")
-            server.Publish(name_topic, payload, qos=1, retain=True)
+            server.Publish(name_topic, payload, qos=1, retain=False)
 
         return True
 
@@ -888,6 +920,18 @@ class DataHub:
         self.DebugPrint("Publishing to: " + url)
 
         server.Publish(topic, payload, qos, retain, properties)
+
+        
+
+
+    def GetCache(self,url):
+        server_adress,topic = self.SplitPath(url)
+
+        server = self.add_server(server_adress)
+
+        self.DebugPrint("Getting cached from: " + url)
+
+        return server.get_cached(topic)
 
     def Link(self,url, target):
 
@@ -940,7 +984,7 @@ class DynSec:
             self._subscribed = True  # idempotent nog; din Broker kan själv hantera dubbletter
 
     # ---- generell handler för alla dynsec-svar ----
-    def _on_response(self, topic, payload, private):
+    def _on_response(self, topic, payload, msg_type: message_type):
         try:
             data = json.loads(payload.decode("utf-8"))
         except Exception:
