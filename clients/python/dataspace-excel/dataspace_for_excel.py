@@ -22,6 +22,7 @@ login_interface.AddDataHub(datahub)
 
 published_values = {}
 
+
 # Add MQTT credentials
 #datahub.add_credentials("mqtt://iot.digivis.se", "test", "test")
 
@@ -415,45 +416,62 @@ register_handler("*.png",  lambda url, b: _handle_image(url, b, ".png"))
 
 # ---------- Main ----------
 
+
 @xlo.func
-def sync_data(topic:str,value = None):
+def sync_data(topic: str, value=None, formatter=None):
     """
-    Syncs the given range to force recalculation of RTD functions.
-    Useful when data updates are needed.
+    Syncs live dataspace values to Excel using RTD.
+    - Preserves your publish-on-change logic
+    - Prevents duplicate subscriptions
+    - Prevents reexecution loops by caching RTD objects
     """
+    #print(f"Sync data called for topic: {topic} with value: {value}")
 
-    global published_values
+    cell = xlo.Caller()
 
+    #None if no caller
+    address = cell.address() if cell else None   # MUST be called
+   
+
+    # --- Publish updated values (your original logic preserved) ---
     if value is not None:
-        #Get adress of cell 
-        cell = xlo.Caller()
         
         if cell:
-            adress = cell.address()
-            if adress in published_values:
-                if published_values[adress] != value:
-                    published_values[adress] = value
-                    datahub.Publish(topic, value)
-                    return True
+            
 
-        
+            # First-time publish at this cell
+            if address not in published_values:
+                print(f"Initial publish to {topic}: {value}")
+                published_values[address] = value
+                datahub.Publish(topic, json.dumps(value))
+            else:
+                # Only publish when changed
+                if published_values[address] != value:
+                    published_values[address] = value
+                    print(f"Publishing updated value to {topic}: {value}")
+                    datahub.Publish(topic, json.dumps(value))
+                else:
+                    print(f"No change for {topic}. Not publishing.")
+        else:
+            print("Warning: No caller cell found.")
 
-        #Check if exist i global variable
-
-    
+    # --- Credential check ---
     if not check_credentials(topic):
-        return "No credentials found. Please use server management tab to add them."
+        return "No credentials found. Please add credentials."
 
-    if topic == None or topic == "":
+    if not topic:
         return "No topic specified"
 
-    #if topic not in _publishers:
+    # --- Ensure RTD publisher exists ---
     if _rtd_server.peek(topic) is None:
-
         print(f"Creating LiveDataPublisher for {topic}")
-        pub = LiveDataPublisher(topic)
+        pub = LiveDataPublisher(topic, formatter)
         _rtd_server.start(pub)
         _rtd_server.publish(topic, "NaN")
+
+    else:
+        #print(f"LiveDataPublisher for {topic} already exists.")
+        pass
 
     return _rtd_server.subscribe(topic)
 
@@ -824,6 +842,18 @@ def load_3d_model(model_path: str):
 #     return "Credentials added at " + timestamp
 
 @xlo.func
+def subscribe(topic: str):
+    """
+    Excel function that subscribes to an MQTT topic and updates the cell in real time.
+    - topic: The MQTT topic to subscribe to.
+
+    Example usage in Excel:
+      =subscribe_livedata("mqtt://iot.digivis.se/datadirectory/TestArea/signalA")
+    """
+    return subscribe_livedata(topic)
+
+
+@xlo.func
 def subscribe_livedata(topic: str):
     """
     Excel function that subscribes to an MQTT topic and updates the cell in real time.
@@ -907,36 +937,35 @@ def generate_matrix(rows: int, cols: int, start: float = 1, step: float = 1):
     ]
 
 class LiveDataPublisher(xlo.RtdPublisher):
-    def __init__(self, topic: str):
+    def __init__(self, topic: str,formatter=None):
         """
         A publisher that subscribes to an MQTT topic via `DataHub`
         and updates Excel with real-time data.
         """
         super().__init__()
         self._topic = topic 
+        self._formatter = formatter
 
 
         #Slice the topic to get the subtopic
-        parts = topic.split("[")
-        self._maintopic = parts[0]
+        
+        self._maintopic = topic
         self._subtopic = None
 
-        if len(parts) > 1:
-            self._subtopic = parts[1].split("]")[0]
 
         self._subscribed = False
 
         print(f"LiveDataPublisher created for {self._topic}")
         print(f"Main topic: {self._maintopic}")
-        print(f"Subtopic: {str(self._subtopic)}")
+       
 
     def connect(self, num_subscribers: int):
-        """ 
-        Called when at least one Excel cell subscribes to this topic.
-        """
-        if not self._subscribed:
+        """Called when at least one Excel cell subscribes."""
+        print(f"LiveDataPublisher connect called for {self._topic} with {num_subscribers} subscribers.")
+
+        if num_subscribers > 0 and not self._subscribed:
             print(f"Subscribing to {self._topic} via DataHub...")
-            datahub.Subscribe(self._maintopic, self.on_message)  # Subscribe using DataHub
+            datahub.Subscribe(self._topic, self.on_message)
             self._subscribed = True
 
     def on_message(self, topic, payload,private):
@@ -944,30 +973,20 @@ class LiveDataPublisher(xlo.RtdPublisher):
         Called when a new message arrives from the MQTT broker.
         """
 
-        topic = "mqtt://iot.digivis.se/" + topic
+        #topic = "mqtt://iot.digivis.se/" + topic
 
         #print(f"Received MQTT data for {topic}: {payload}")
 
-        decoded_payload = payload.decode("utf-8")
-
-        
+        #Check if parsed json or bindary
+        if isinstance(payload, (bytes, bytearray)):
+            decoded_payload = payload.decode("utf-8")
+        else:
+            decoded_payload = payload
+            
 
         #print(f"Publishing data for {topic}: {decoded_payload}")
 
 
-        if self._subtopic != None:
-
-            #print(f"Subtopic: {self._subtopic}")
-            try:
-                json_payload = json.loads(payload)
-                #print(f"JSON payload: {json_payload}")
-                decoded_payload = json_payload[self._subtopic]
-                #print(f"Decoded payload: {decoded_payload}")
-            except Exception as e:
-                print(f"Error parsing JSON: {e}")
-                return
-        else:
-            print("No subtopic")
 
         # Convert the payload to a string
         #if isinstance(payload, bytes):
@@ -975,16 +994,24 @@ class LiveDataPublisher(xlo.RtdPublisher):
 
 
         #self.publish(payload)
-        _rtd_server.publish(self.topic(), decoded_payload) 
+        if self._formatter:
+            formatted_payload = self._formatter(decoded_payload)
+            _rtd_server.publish(self.topic(), formatted_payload)
+        else:
+            _rtd_server.publish(self.topic(), decoded_payload) 
 
     def disconnect(self, num_subscribers: int):
-        """
-        Called when all subscribers have unsubscribed.
-        """
+
+        print(f"LiveDataPublisher disconnect called for {self._topic} with {num_subscribers} subscribers.")
+
         if num_subscribers == 0:
-            self.stop()
+            print(f"Stopping subscription to {self._topic}")
+            self._subscribed = False
             datahub.Unsubscribe(self._topic, self.on_message)
             return True
+        else:
+            return False
+
 
     def stop(self):
         """
