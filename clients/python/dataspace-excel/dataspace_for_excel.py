@@ -9,9 +9,9 @@ from urllib.request import urlretrieve
 import login_interface
 import figures
 import hashlib
+import json_formatting
 
-
-
+ 
 # Single RtdServer shared by all topics
 _rtd_server = xlo.RtdServer()
 
@@ -443,13 +443,13 @@ def sync_data(topic: str, value=None, formatter=None):
             if address not in published_values:
                 print(f"Initial publish to {topic}: {value}")
                 published_values[address] = value
-                datahub.Publish(topic, json.dumps(value))
+                datahub.Publish(topic, value)
             else:
                 # Only publish when changed
                 if published_values[address] != value:
                     published_values[address] = value
                     print(f"Publishing updated value to {topic}: {value}")
-                    datahub.Publish(topic, json.dumps(value))
+                    datahub.Publish(topic, value)
                 else:
                     print(f"No change for {topic}. Not publishing.")
         else:
@@ -463,15 +463,26 @@ def sync_data(topic: str, value=None, formatter=None):
         return "No topic specified"
 
     # --- Ensure RTD publisher exists ---
-    if _rtd_server.peek(topic) is None:
-        print(f"Creating LiveDataPublisher for {topic}")
+    value = _rtd_server.peek(topic)
+
+    #Print value
+    print(f"RTD value for {topic}: {value} \n")
+
+    if value is None:
+        #print(f"Creating LiveDataPublisher for {topic}")
         pub = LiveDataPublisher(topic, formatter)
         _rtd_server.start(pub)
-        _rtd_server.publish(topic, "NaN")
+        #_rtd_server.publish(topic, "NaN")
 
     else:
         #print(f"LiveDataPublisher for {topic} already exists.")
         pass
+
+    #if pub._subscribed is False:
+    #    print(f" Not subscribed.")
+    #    _rtd_server.start(pub)
+
+    #print
 
     return _rtd_server.subscribe(topic)
 
@@ -876,7 +887,7 @@ def subscribe_livedata(topic: str):
         print(f"Creating LiveDataPublisher for {topic}")
         pub = LiveDataPublisher(topic)
         _rtd_server.start(pub)
-        _rtd_server.publish(topic, "NaN")
+        _rtd_server.publish(topic, "NaN - waiting for data...")
 
     return _rtd_server.subscribe(topic)
 
@@ -955,20 +966,23 @@ class LiveDataPublisher(xlo.RtdPublisher):
 
         self._subscribed = False
 
-        print(f"LiveDataPublisher created for {self._topic}")
-        print(f"Main topic: {self._maintopic}")
+        print(f"LiveDataPublisher created for: \n{self._topic} \n")
+        
        
 
     def connect(self, num_subscribers: int):
         """Called when at least one Excel cell subscribes."""
-        print(f"LiveDataPublisher connect called for {self._topic} with {num_subscribers} subscribers.")
+        print(f"LiveDataPublisher connect called for {self._topic} with {num_subscribers} subscribers.\n")
+
+        #_rtd_server.publish(self.topic(),"NaN") 
 
         if num_subscribers > 0 and not self._subscribed:
-            print(f"Subscribing to {self._topic} via DataHub...")
+            print(f"Subscribing to {self._topic} via DataHub... \n")
+            
             datahub.Subscribe(self._topic, self.on_message)
             self._subscribed = True
 
-    def on_message(self, topic, payload,private):
+    def on_message(self, topic, payload,msg_type):
         """
         Called when a new message arrives from the MQTT broker.
         """
@@ -983,8 +997,8 @@ class LiveDataPublisher(xlo.RtdPublisher):
         else:
             decoded_payload = payload
             
-
-        #print(f"Publishing data for {topic}: {decoded_payload}")
+        #if self.topic() == "dataspace/TestArea/test.json":  
+        
 
 
 
@@ -996,18 +1010,31 @@ class LiveDataPublisher(xlo.RtdPublisher):
         #self.publish(payload)
         if self._formatter:
             formatted_payload = self._formatter(decoded_payload)
-            _rtd_server.publish(self.topic(), formatted_payload)
+        #Check if object
+        elif isinstance(decoded_payload, (dict, list)):
+            formatted_payload = json.dumps(decoded_payload, indent=2, ensure_ascii=False)
         else:
-            _rtd_server.publish(self.topic(), decoded_payload) 
+            formatted_payload = decoded_payload
+
+        if _rtd_server.peek(self.topic()) == formatted_payload:
+            #No change
+            return
+        
+        print(f"RTD Publishing data for {self._topic}: {formatted_payload} {msg_type}")
+
+        _rtd_server.publish(self.topic(), formatted_payload) 
 
     def disconnect(self, num_subscribers: int):
 
         print(f"LiveDataPublisher disconnect called for {self._topic} with {num_subscribers} subscribers.")
 
+        
+
         if num_subscribers == 0:
             print(f"Stopping subscription to {self._topic}")
             self._subscribed = False
             datahub.Unsubscribe(self._topic, self.on_message)
+            _rtd_server.publish(self.topic(),None)
             return True
         else:
             return False
@@ -1021,6 +1048,8 @@ class LiveDataPublisher(xlo.RtdPublisher):
 
         #_rtd_server.publish(self.topic(), "-")
         self._subscribed = False  # No explicit unsubscribe function in DataHub?
+        datahub.Unsubscribe(self._topic, self.on_message)
+        _rtd_server.publish(self.topic(),None)
 
     def topic(self):
         """

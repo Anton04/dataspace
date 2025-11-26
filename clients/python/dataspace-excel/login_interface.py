@@ -60,7 +60,7 @@ def xor_encrypt(data: bytes, key: bytes) -> bytes:
 def xor_decrypt(data: bytes, key: bytes) -> bytes:
     return xor_encrypt(data, key)  # samma operation
 
-def load_credentials(filename=None):
+def old_load_credentials(filename=None):
     global _servers
     #If no filenmame is given, use default in user appdata folder
     if filename is None:
@@ -80,6 +80,61 @@ def load_credentials(filename=None):
         xlo.log("Credentials file not found, starting with empty server list.")
     except Exception as e:
         xlo.log(f"Error loading credentials: {e}")
+
+def load_credentials(filename=None):
+    global _servers
+
+    # Bestäm sökväg
+    if filename is None:
+        import os
+        appdata = os.getenv('APPDATA')
+        filename = os.path.join(appdata, 'dataspace_credentials.txt')
+
+    try:
+        with open(filename, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+
+        _servers = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split(',')
+            if len(parts) != 3:
+                xlo.log(f"Ignoring invalid credential line: {line!r}")
+                continue
+
+            name, user, enc_pass = parts
+            dec_pass = None  # default if decoding fails
+
+            # Försök dekryptera lösenordet
+            try:
+                raw = bytes.fromhex(enc_pass)            # kan faila om hex är odd/korrupt
+                decrypted = xor_decrypt(raw, machine_key())
+                dec_pass = decrypted.decode("utf-8")     # kan faila om key är annorlunda
+            except Exception as err:
+                xlo.log(f"Password decode failed for server '{name}': {err}")
+                dec_pass = None
+
+            _servers.append({"name": name, "user": user, "pass": dec_pass})
+
+        # Efter att alla servrar laddats → be om nytt lösenord för de som saknar
+        for srv in _servers:
+            if srv["pass"] is None:
+                xlo.log(f"Lösenord saknas/korrumperat för '{srv['name']}'. Ber användaren mata in nytt.")
+                ask_for_password(srv)
+
+    except FileNotFoundError:
+        xlo.log("Credentials file not found, starting with empty server list.")
+        _servers = [{"name": "New", "user": "", "pass": ""}]
+
+    except Exception as e:
+        xlo.log(f"Error loading credentials: {e}")
+        # fallback if serious error, to avoid Excel crashing
+        _servers = [{"name": "New", "user": "", "pass": ""}]
+
 
 #Load upon start.
 if storecredentials:
@@ -197,7 +252,7 @@ def get_servers(ctrl,n):
     # Ribbon dropdown måste returnera en lista av tuples (id, label)
 
 
-    if n > len(_servers):
+    if n >= len(_servers):
         return None
     
     return _servers[n]["name"]
