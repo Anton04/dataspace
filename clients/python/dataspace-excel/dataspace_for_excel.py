@@ -466,7 +466,7 @@ def sync_data(topic: str, value=None, formatter=None):
     value = _rtd_server.peek(topic)
 
     #Print value
-    print(f"RTD value for {topic}: {value} \n")
+    #print(f"RTD value for {topic}: {value} \n")
 
     if value is None:
         #print(f"Creating LiveDataPublisher for {topic}")
@@ -1020,7 +1020,7 @@ class LiveDataPublisher(xlo.RtdPublisher):
             #No change
             return
         
-        print(f"RTD Publishing data for {self._topic}: {formatted_payload} {msg_type}")
+        #print(f"RTD Publishing data for {self._topic}: {formatted_payload} {msg_type}")
 
         _rtd_server.publish(self.topic(), formatted_payload) 
 
